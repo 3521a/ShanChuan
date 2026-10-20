@@ -1,3 +1,4 @@
+
 name: CNN Fear and Greed Alert
 
 on:
@@ -31,16 +32,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
 
       - name: 安装依赖
         run: python -m pip install --upgrade requests matplotlib
 
       - name: 检查指数并发送邮件
         env:
-          FORCE_SEND: ${{ inputs.force }}
+          FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true && 'true' || 'false' }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
           MAIL_PASS: ${{ secrets.MAIL_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-          PYTHONUNBUFFERED: "1"
         run: python -u fng_alert.py
