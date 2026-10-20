@@ -171,4 +171,65 @@ def build_html(data, score, has_trend):
   <div style="background:{color};padding:22px 24px;color:#fff">
     <div style="font-size:13px;opacity:.9">美股 · CNN 恐惧与贪婪指数</div>
     <div style="font-size:26px;font-weight:bold;margin-top:4px">{zone_name}</div>
-    <div style="font-size:12px;opacity:.85;margin-top
+    <div style="font-size:12px;opacity:.85;margin-top:4px">{now_cn}(北京时间)</div>
+  </div>
+  <div style="padding:16px 24px 0;text-align:center">
+    <img src="cid:gauge" style="width:100%;max-width:420px" alt="gauge">
+  </div>
+  <div style="margin:4px 24px 0;padding:12px 14px;background:#f7f8fa;border-left:4px solid {color};border-radius:4px;font-size:14px;color:#333;line-height:1.6">{summary}</div>
+  <div style="padding:20px 24px 0"><div style="font-size:15px;font-weight:bold;color:#222">历史对比</div>
+    <table style="width:100%;border-collapse:collapse;margin-top:4px"><tr>{cells}</tr></table></div>
+  {trend_block}
+  {indicator_block}
+  <div style="padding:20px 24px 24px;font-size:11px;color:#999;line-height:1.6">
+    数据来源:CNN Fear &amp; Greed Index。提醒阈值:≤{LOW} 或 ≥{HIGH}。<br>本邮件由脚本自动生成,仅供参考,不构成投资建议。
+  </div>
+</div></body></html>"""
+
+
+def send_mail(subject, plain, html, images):
+    msg = MIMEMultipart("related")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = os.environ["MAIL_USER"]
+    msg["To"] = os.environ["MAIL_TO"]
+    alt = MIMEMultipart("alternative")
+    msg.attach(alt)
+    alt.attach(MIMEText(plain, "plain", "utf-8"))
+    alt.attach(MIMEText(html, "html", "utf-8"))
+    for cid, data in images.items():
+        img = MIMEImage(data, "png")
+        img.add_header("Content-ID", f"<{cid}>")
+        img.add_header("Content-Disposition", "inline", filename=f"{cid}.png")
+        msg.attach(img)
+    with smtplib.SMTP_SSL(os.getenv("SMTP_HOST", "smtp.gmail.com"), 465) as s:
+        s.login(os.environ["MAIL_USER"], os.environ["MAIL_PASS"])
+        s.send_message(msg)
+
+
+def main():
+    r = requests.get(URL, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    fg = data["fear_and_greed"]
+    score = round(fg["score"])
+    _, zone_name = zone_of(score)
+    print(f"当前指数: {score} ({fg.get('rating')})")
+
+    if not (score <= LOW or score >= HIGH or FORCE):
+        print("未触发阈值,不发送邮件。")
+        return
+
+    images = {"gauge": gauge_png(score)}
+    hist = (data.get("fear_and_greed_historical") or {}).get("data") or []
+    trend = trend_png(hist)
+    if trend:
+        images["trend"] = trend
+
+    emoji = "⚠️" if score <= LOW else "🔥" if score >= HIGH else "📊"
+    subject = f"{emoji} 美股恐惧与贪婪指数 {score}|{zone_name}"
+    plain = f"CNN 恐惧与贪婪指数:{score}({zone_name})。请使用支持 HTML 的邮件客户端查看完整简报。"
+    send_mail(subject, plain, build_html(data, score, "trend" in images), images)
+    print("邮件已发送")
+
+
+main()
