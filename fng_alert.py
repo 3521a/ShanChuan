@@ -1,9 +1,16 @@
+
 import os
+import ssl
+import time
 import smtplib
 import logging
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
+from email.header import Header
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from email.utils import formatdate
 
 import requests
@@ -13,28 +20,38 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.patches import Wedge, Circle
 
-# ==================== 基础配置 ====================
-LOW, HIGH = 25, 75
+
+# ==================== 基本设置 ====================
+
+LOW = 25
+HIGH = 75
 BEIJING = timezone(timedelta(hours=8))
+
 FORCE = os.getenv("FORCE_SEND", "false").lower() == "true"
 
-URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+CNN_URL = (
+    "https://production.dataviz.cnn.io/"
+    "index/fearandgreed/graphdata"
+)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept": "application/json, text/plain, */*",
-    "Referer": "https://edition.cnn.com/markets/fear-and-greed",
+    "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://edition.cnn.com",
+    "Referer": "https://edition.cnn.com/markets/fear-and-greed",
 }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
 ZONES = [
-    (0, 25, "#d94841", "极度恐惧"),
-    (25, 45, "#ed9f43", "恐惧"),
-    (45, 55, "#87919c", "中性"),
-    (55, 75, "#70a96b", "贪婪"),
-    (75, 100, "#21845b", "极度贪婪"),
+    (0, 25, "#d9534f", "极度恐惧"),
+    (25, 45, "#f0ad4e", "恐惧"),
+    (45, 55, "#9aa0a6", "中性"),
+    (55, 75, "#7cb342", "贪婪"),
+    (75, 100, "#2e7d32", "极度贪婪"),
 ]
 
 RATING_CN = {
@@ -46,67 +63,166 @@ RATING_CN = {
 }
 
 INDICATORS = [
-    ("market_momentum_sp500", "市场动能"),
+    ("market_momentum_sp500", "市场动量"),
     ("stock_price_strength", "股价强度"),
     ("stock_price_breadth", "股价广度"),
-    ("put_call_options", "看跌 / 看涨期权"),
+    ("put_call_options", "看跌/看涨期权"),
     ("market_volatility_vix", "市场波动率"),
     ("safe_haven_demand", "避险需求"),
     ("junk_bond_demand", "垃圾债需求"),
 ]
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
-def zone_of(score):
-    for lo, hi, color, name in ZONES:
-        if score <= hi:
-            return color, name
-    return ZONES[-1][2], ZONES[-1][3]
 
+# ==================== 数据获取 ====================
 
 def get_data():
-    response = requests.get(URL, headers=HEADERS, timeout=30)
-    response.raise_for_status()
-    data = response.json()
+    """获取 CNN 指数。失败时重试，绝不伪造数据。"""
+    last_error = None
 
-    fg = data.get("fear_and_greed")
-    if not isinstance(fg, dict) or fg.get("score") is None:
-        raise ValueError("CNN 返回的数据中没有 fear_and_greed.score")
+    with requests.Session() as session:
+        session.headers.update(HEADERS)
 
-    score = float(fg["score"])
-    if not 0 <= score <= 100:
-        raise ValueError(f"指数超出合理范围：{score}")
+        for attempt in range(3):
+            try:
+                response = session.get(CNN_URL, timeout=25)
 
-    return data, score
+                if response.status_code == 418:
+                    raise RuntimeError(
+                        "CNN 返回 HTTP 418，拒绝当前云端请求"
+                    )
 
+                response.raise_for_status()
+                data = response.json()
+
+                fg = data.get("fear_and_greed")
+                if not isinstance(fg, dict) or "score" not in fg:
+                    raise ValueError("CNN 响应中没有有效的指数数据")
+
+                score = float(fg["score"])
+                if not 0 <= score <= 100:
+                    raise ValueError(f"指数超出有效范围：{score}")
+
+                logging.info("CNN 指数获取成功：%.2f", score)
+                return data, score
+
+            except Exception as exc:
+                last_error = exc
+                logging.warning(
+                    "获取指数失败，第 %s/3 次：%s",
+                    attempt + 1,
+                    exc,
+                )
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+
+    raise RuntimeError(
+        "无法取得可靠的 CNN 指数。"
+        "本次不会发送市场阈值提醒，请查看运行日志。"
+    ) from last_error
+
+
+# ==================== 指数区间 ====================
+
+def zone_of(score):
+    score = float(score)
+
+    if score < 25:
+        return "#d9534f", "极度恐惧"
+    if score < 45:
+        return "#f0ad4e", "恐惧"
+    if score <= 55:
+        return "#9aa0a6", "中性"
+    if score <= 75:
+        return "#7cb342", "贪婪"
+    return "#2e7d32", "极度贪婪"
+
+
+def cn_rating(value):
+    return RATING_CN.get(
+        str(value or "").lower(),
+        "暂无评级",
+    )
+
+
+def safe_number(value):
+    try:
+        result = float(value)
+        if 0 <= result <= 100:
+            return result
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+# ==================== 图表生成 ====================
 
 def gauge_png(score):
-    fig, ax = plt.subplots(figsize=(7, 4))
-    fig.patch.set_facecolor("#15191f")
-    ax.set_facecolor("#15191f")
+    fig, ax = plt.subplots(figsize=(7, 4.1))
 
     for lo, hi, color, _ in ZONES:
-        ax.add_patch(Wedge(
-            (0, 0), 1, 180 - hi * 1.8, 180 - lo * 1.8,
-            width=0.22, facecolor=color, edgecolor="#15191f", linewidth=2
-        ))
+        ax.add_patch(
+            Wedge(
+                (0, 0),
+                1,
+                180 - hi * 1.8,
+                180 - lo * 1.8,
+                width=0.25,
+                facecolor=color,
+                edgecolor="white",
+                linewidth=2,
+            )
+        )
 
-    for v in (0, 25, 50, 75, 100):
+    for value in (0, 25, 50, 75, 100):
+        angle = (180 - value * 1.8) * 3.141592653589793 / 180
         import math
-        a = math.radians(180 - v * 1.8)
-        ax.text(1.13 * math.cos(a), 1.13 * math.sin(a), str(v),
-                ha="center", va="center", color="#aab2bd", fontsize=10)
+        ax.text(
+            1.12 * math.cos(angle),
+            1.12 * math.sin(angle),
+            str(value),
+            ha="center",
+            va="center",
+            fontsize=10,
+            color="#666666",
+        )
 
     import math
-    a = math.radians(180 - score * 1.8)
-    ax.plot([0, 0.72 * math.cos(a)], [0, 0.72 * math.sin(a)],
-            color="#ffffff", linewidth=4, solid_capstyle="round")
-    ax.add_patch(Circle((0, 0), 0.055, color="#ffffff"))
+    angle = (180 - score * 1.8) * 3.141592653589793 / 180
 
-    color, name = zone_of(score)
-    ax.text(0, -0.25, f"{score:.1f}", ha="center", va="center",
-            fontsize=35, fontweight="bold", color="#ffffff")
-    ax.text(0, -0.49, name, ha="center", va="center",
-            fontsize=15, fontweight="bold", color=color)
+    ax.plot(
+        [0, 0.70 * math.cos(angle)],
+        [0, 0.70 * math.sin(angle)],
+        color="#202124",
+        linewidth=4,
+        solid_capstyle="round",
+    )
+    ax.add_patch(Circle((0, 0), 0.06, color="#202124"))
+
+    color, label = zone_of(score)
+    ax.text(
+        0,
+        -0.28,
+        f"{score:.1f}",
+        ha="center",
+        va="center",
+        fontsize=34,
+        fontweight="bold",
+        color=color,
+    )
+    ax.text(
+        0,
+        -0.48,
+        label,
+        ha="center",
+        va="center",
+        fontsize=13,
+        color=color,
+    )
 
     ax.set_xlim(-1.25, 1.25)
     ax.set_ylim(-0.65, 1.25)
@@ -114,263 +230,345 @@ def gauge_png(score):
     ax.axis("off")
 
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=160, facecolor=fig.get_facecolor(),
-                bbox_inches="tight")
+    fig.savefig(
+        buf,
+        format="png",
+        dpi=160,
+        facecolor="white",
+        bbox_inches="tight",
+    )
     plt.close(fig)
     return buf.getvalue()
 
 
 def trend_png(data):
-    hist = (data.get("fear_and_greed_historical") or {}).get("data") or []
-    points = []
+    history = (
+        data.get("fear_and_greed_historical") or {}
+    ).get("data") or []
 
-    for item in hist:
+    points = []
+    for item in history:
         try:
-            x = float(item["x"])
-            y = float(item["y"])
-            if 0 <= y <= 100:
-                points.append((datetime.fromtimestamp(x / 1000, timezone.utc), y))
+            timestamp = float(item["x"]) / 1000
+            value = float(item["y"])
+            if 0 <= value <= 100:
+                points.append(
+                    (
+                        datetime.fromtimestamp(
+                            timestamp, tz=timezone.utc
+                        ),
+                        value,
+                    )
+                )
         except (KeyError, TypeError, ValueError, OSError):
             continue
 
-    points.sort(key=lambda p: p[0])
-    points = points[-365:]
-
+    points = points[-90:]
     if len(points) < 2:
         return None
 
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
+    dates = [p[0] for p in points]
+    values = [p[1] for p in points]
 
-    fig, ax = plt.subplots(figsize=(8, 3.2))
-    fig.patch.set_facecolor("#ffffff")
-    ax.set_facecolor("#ffffff")
+    fig, ax = plt.subplots(figsize=(7, 2.8))
+    ax.axhspan(0, LOW, color="#d9534f", alpha=0.12)
+    ax.axhspan(HIGH, 100, color="#2e7d32", alpha=0.12)
+    ax.axhline(LOW, color="#d9534f", linestyle="--", linewidth=1)
+    ax.axhline(HIGH, color="#2e7d32", linestyle="--", linewidth=1)
 
-    ax.axhspan(0, LOW, color="#d94841", alpha=0.10)
-    ax.axhspan(HIGH, 100, color="#21845b", alpha=0.10)
-    ax.axhline(LOW, color="#d94841", linestyle="--", linewidth=1)
-    ax.axhline(HIGH, color="#21845b", linestyle="--", linewidth=1)
-    ax.plot(xs, ys, color="#2463eb", linewidth=2)
-    ax.scatter([xs[-1]], [ys[-1]], color="#2463eb", s=25, zorder=3)
+    ax.plot(dates, values, linewidth=2)
+    ax.scatter([dates[-1]], [values[-1]], zorder=5)
 
     ax.set_ylim(0, 100)
     ax.set_yticks([0, 25, 50, 75, 100])
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m", tz=timezone.utc))
-    ax.tick_params(labelsize=8, colors="#6b7280")
-    ax.grid(axis="y", alpha=0.18)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    ax.tick_params(labelsize=8)
 
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
 
+    ax.grid(axis="y", alpha=0.2)
     fig.autofmt_xdate()
+
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    fig.savefig(
+        buf,
+        format="png",
+        dpi=160,
+        facecolor="white",
+        bbox_inches="tight",
+    )
     plt.close(fig)
     return buf.getvalue()
 
 
-def delta_html(current, previous):
-    if previous is None:
-        return ""
-    diff = current - previous
-    arrow = "▲" if diff > 0 else "▼" if diff < 0 else "—"
-    color = "#21845b" if diff > 0 else "#d94841" if diff < 0 else "#87919c"
-    return (
-        f'<div style="font-size:12px;color:{color};margin-top:3px">'
-        f'{arrow} {abs(diff):.1f}</div>'
-    )
+# ==================== 邮件 HTML 面板 ====================
 
+def build_html(data, score, has_trend):
+    fg = data.get("fear_and_greed") or {}
+    color, label = zone_of(score)
+    now = datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M:%S")
 
-def build_html(data, score, images):
-    fg = data["fear_and_greed"]
-    color, zone_name = zone_of(score)
-    now = datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M")
-    rating = RATING_CN.get(str(fg.get("rating", "")).lower(), zone_name)
-
-    if score <= LOW:
-        status = "低位情绪提醒已触发"
-    elif score >= HIGH:
-        status = "高位情绪提醒已触发"
+    if score < LOW:
+        summary = (
+            "指数低于 25，已触发极度恐惧提醒。"
+            "极端情绪不代表市场必然见底。"
+        )
+    elif score > HIGH:
+        summary = (
+            "指数高于 75，已触发极度贪婪提醒。"
+            "极端情绪不代表市场必然见顶。"
+        )
+    elif FORCE:
+        summary = "这是一封手动测试邮件，当前指数未达到提醒阈值。"
     else:
-        status = "手动测试邮件"
+        summary = "当前指数处于常规区间。"
 
-    periods = [
-        ("昨日", "previous_close"),
+    history_items = [
+        ("昨日收盘", "previous_close"),
         ("一周前", "previous_1_week"),
         ("一个月前", "previous_1_month"),
         ("一年前", "previous_1_year"),
     ]
 
-    cells = ""
-    for label, key in periods:
-        value = fg.get(key)
+    history_cells = ""
+    for title, key in history_items:
+        value = safe_number(fg.get(key))
         if value is None:
-            value_html = '<div style="font-size:23px;color:#aab2bd">—</div>'
+            display = "—"
+            value_color = "#999999"
+            rating = ""
         else:
-            value = float(value)
-            pc, pn = zone_of(value)
-            value_html = (
-                f'<div style="font-size:23px;font-weight:bold;color:{pc}">{value:.0f}</div>'
-                f'<div style="font-size:11px;color:{pc}">{pn}</div>'
-                f'{delta_html(score, value)}'
-            )
-        cells += (
-            f'<td style="width:25%;text-align:center;padding:12px 3px;'
-            f'border-right:1px solid #edf0f3">'
-            f'<div style="font-size:12px;color:#7b8490">{label}</div>'
-            f'{value_html}</td>'
-        )
+            display = f"{value:.0f}"
+            value_color, rating = zone_of(value)
 
-    rows = ""
-    for key, label in INDICATORS:
+        history_cells += f"""
+        <td style="text-align:center;padding:12px 3px">
+          <div style="font-size:12px;color:#7b8490">{title}</div>
+          <div style="font-size:23px;font-weight:bold;color:{value_color}">
+            {display}
+          </div>
+          <div style="font-size:11px;color:{value_color}">{rating}</div>
+        </td>
+        """
+
+    indicator_rows = ""
+    for key, name in INDICATORS:
         item = data.get(key) or {}
-        value = item.get("score")
+        value = safe_number(item.get("score"))
+
         if value is None:
             continue
-        try:
-            value = max(0, min(100, float(value)))
-        except (ValueError, TypeError):
-            continue
 
-        pc, pn = zone_of(value)
-        rating_cn = RATING_CN.get(str(item.get("rating", "")).lower(), pn)
-        rows += (
-            f'<tr><td style="padding:12px 6px 12px 0;font-size:13px;'
-            f'color:#28313c;border-bottom:1px solid #edf0f3">{label}</td>'
-            f'<td style="padding:12px 8px;border-bottom:1px solid #edf0f3">'
-            f'<div style="background:#edf0f3;height:8px;border-radius:5px">'
-            f'<div style="background:{pc};width:{value}%;height:8px;border-radius:5px"></div>'
-            f'</div></td>'
-            f'<td style="padding:12px 0;text-align:right;border-bottom:1px solid #edf0f3;'
-            f'white-space:nowrap;color:{pc};font-weight:bold;font-size:13px">'
-            f'{value:.0f} {rating_cn}</td></tr>'
-        )
+        bar_color, _ = zone_of(value)
+        rating = cn_rating(item.get("rating"))
 
-    trend_block = ""
-    if "trend" in images:
-        trend_block = (
-            '<div style="padding:22px 24px 0">'
-            '<div style="font-size:16px;font-weight:bold;margin-bottom:10px;color:#202833">'
-            '近一年历史走势</div>'
-            '<img src="cid:trend" alt="指数走势" '
-            'style="display:block;width:100%;max-width:540px;height:auto">'
-            '<div style="font-size:11px;color:#7b8490;margin-top:7px">'
-            '红色虚线：25；绿色虚线：75</div></div>'
-        )
+        indicator_rows += f"""
+        <tr>
+          <td style="padding:10px 5px 10px 0;font-size:13px">
+            {name}
+          </td>
+          <td style="padding:10px 5px;width:38%">
+            <div style="height:8px;background:#edf0f3;border-radius:8px">
+              <div style="height:8px;width:{value}%;
+                background:{bar_color};border-radius:8px"></div>
+            </div>
+          </td>
+          <td style="padding:10px 0;text-align:right;
+            white-space:nowrap;color:{bar_color};font-weight:bold">
+            {value:.0f} {rating}
+          </td>
+        </tr>
+        """
 
-    indicators_block = ""
-    if rows:
-        indicators_block = (
-            '<div style="padding:22px 24px 0">'
-            '<div style="font-size:16px;font-weight:bold;margin-bottom:6px;color:#202833">'
-            '市场情绪子指标</div>'
-            '<table style="width:100%;border-collapse:collapse">'
-            f'{rows}</table></div>'
-        )
+    if not indicator_rows:
+        indicator_rows = """
+        <tr><td colspan="3" style="padding:12px;color:#888">
+          当前数据源没有提供子指标数据。
+        </td></tr>
+        """
 
-    summary = (
-        "市场情绪处于低位，建议关注波动和风险管理。"
-        if score <= LOW else
-        "市场情绪处于高位，注意避免盲目追涨。"
-        if score >= HIGH else
-        "当前指数未触发自动提醒阈值，本邮件用于手动测试。"
-    )
+    trend_section = ""
+    if has_trend:
+        trend_section = """
+        <section style="padding:22px 24px 0">
+          <h3 style="font-size:16px;margin:0 0 10px">
+            近期指数走势
+          </h3>
+          <img src="cid:trend" alt="指数走势"
+            style="width:100%;max-width:600px;display:block">
+          <p style="font-size:11px;color:#8b929c">
+            虚线为 25 和 75 的提醒阈值。
+          </p>
+        </section>
+        """
 
     return f"""<!doctype html>
-<html><body style="margin:0;padding:16px;background:#eef1f5;font-family:Arial,'Microsoft YaHei',sans-serif">
-<div style="max-width:620px;margin:0 auto;background:#fff;border:1px solid #e1e5eb;border-radius:16px;overflow:hidden">
-  <div style="background:#15191f;padding:22px 24px;color:#fff">
-    <div style="font-size:12px;letter-spacing:2px;color:#c2c9d2">FEAR &amp; GREED BRIEF</div>
-    <div style="font-size:14px;margin-top:18px;color:#c2c9d2">美股 · CNN 恐惧与贪婪指数</div>
-    <div style="font-size:30px;font-weight:bold;margin-top:6px">{score:.1f}<span style="font-size:15px;color:{color};margin-left:12px">{zone_name}</span></div>
-    <div style="font-size:12px;color:#c2c9d2;margin-top:7px">{now} 北京时间 · {status}</div>
-  </div>
-  <div style="padding:18px 24px 0;text-align:center;background:#15191f">
-    <img src="cid:gauge" alt="指数仪表盘" style="width:100%;max-width:420px;height:auto">
-  </div>
-  <div style="padding:18px 24px;background:#fff">
-    <div style="padding:13px 15px;background:#f5f7fa;border-left:4px solid {color};border-radius:5px;color:#28313c;font-size:14px;line-height:1.7">
-      <b>{rating}</b> · {summary}
-    </div>
-    <div style="font-size:16px;font-weight:bold;margin-top:22px;color:#202833">历史对比</div>
-    <table style="width:100%;border-collapse:collapse;margin-top:8px"><tr>{cells}</tr></table>
-  </div>
-  {trend_block}
-  {indicators_block}
-  <div style="padding:24px;color:#87919c;font-size:11px;line-height:1.8">
-    数据来源：CNN Fear &amp; Greed Index<br>
-    自动提醒阈值：指数 ≤ {LOW} 或 ≥ {HIGH}。<br>
-    本报告为市场情绪参考，不构成投资建议。指数不代表未来市场走势。
-  </div>
-</div></body></html>"""
+<html>
+<body style="margin:0;padding:16px;background:#edf0f4;
+font-family:Arial,'Microsoft YaHei',sans-serif;color:#222">
+<div style="max-width:680px;margin:auto;background:#fff;
+border-radius:16px;overflow:hidden;border:1px solid #e2e6eb">
 
+  <header style="padding:24px;background:#17191d;color:#fff">
+    <div style="font-size:12px;letter-spacing:2px;color:#c6cbd2">
+      FEAR &amp; GREED BRIEF
+    </div>
+    <h1 style="font-size:21px;margin:14px 0 5px">
+      美股 · CNN 恐惧与贪婪指数
+    </h1>
+    <div style="font-size:13px;color:#c6cbd2">
+      数据检查时间：北京时间 {now}
+    </div>
+  </header>
+
+  <section style="padding:18px 22px 0;text-align:center">
+    <div style="font-size:14px;color:#7b8490">当前指数</div>
+    <div style="font-size:48px;font-weight:bold;color:{color}">
+      {score:.1f}
+    </div>
+    <div style="font-size:17px;font-weight:bold;color:{color}">
+      {label}
+    </div>
+    <img src="cid:gauge" alt="指数仪表盘"
+      style="width:100%;max-width:460px;display:block;margin:auto">
+  </section>
+
+  <section style="margin:12px 22px;padding:15px;
+  background:#f6f7f9;border-left:4px solid {color};
+  line-height:1.7;font-size:14px">
+    {summary}
+  </section>
+
+  <section style="padding:18px 22px 0">
+    <h3 style="font-size:16px;margin:0">历史对比</h3>
+    <table style="width:100%;border-collapse:collapse">
+      <tr>{history_cells}</tr>
+    </table>
+  </section>
+
+  {trend_section}
+
+  <section style="padding:22px">
+    <h3 style="font-size:16px;margin:0 0 8px">七项市场子指标</h3>
+    <table style="width:100%;border-collapse:collapse">
+      {indicator_rows}
+    </table>
+  </section>
+
+  <footer style="padding:18px 22px;background:#f6f7f9;
+  font-size:11px;line-height:1.8;color:#7b8490">
+    数据来源：CNN Fear &amp; Greed Index。<br>
+    提醒条件：指数严格低于 {LOW} 或严格高于 {HIGH}。<br>
+    指数和子指标可能存在更新延迟。本简报仅供参考，不构成投资建议。
+  </footer>
+</div>
+</body>
+</html>"""
+
+
+# ==================== 邮件发送 ====================
 
 def send_mail(subject, plain, html, images):
-    user = os.environ["MAIL_USER"]
+    username = os.environ["MAIL_USER"]
     password = os.environ["MAIL_PASS"]
     recipient = os.environ["MAIL_TO"]
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = user
-    msg["To"] = recipient
-    msg["Date"] = formatdate(localtime=True)
-    msg.set_content(plain)
-    msg.add_alternative(html, subtype="html")
+    message = MIMEMultipart("related")
+    message["Subject"] = str(Header(subject, "utf-8"))
+    message["From"] = username
+    message["To"] = recipient
+    message["Date"] = formatdate(localtime=True)
 
-    html_part = msg.get_payload()[-1]
-    for cid, image_data in images.items():
-        html_part.add_related(
-            image_data,
-            maintype="image",
-            subtype="png",
-            cid=f"<{cid}>",
-            filename=f"{cid}.png",
-            disposition="inline",
+    alternative = MIMEMultipart("alternative")
+    message.attach(alternative)
+
+    alternative.attach(MIMEText(plain, "plain", "utf-8"))
+    alternative.attach(MIMEText(html, "html", "utf-8"))
+
+    for content_id, image_bytes in images.items():
+        image = MIMEImage(image_bytes, _subtype="png")
+        image.add_header("Content-ID", f"<{content_id}>")
+        image.add_header(
+            "Content-Disposition",
+            "inline",
+            filename=f"{content_id}.png",
         )
+        message.attach(image)
 
     host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    with smtplib.SMTP_SSL(host, 465, timeout=30) as smtp:
-        smtp.login(user, password)
-        smtp.send_message(msg)
+    port = int(os.getenv("SMTP_PORT", "465"))
+
+    with smtplib.SMTP_SSL(
+        host,
+        port,
+        timeout=30,
+        context=ssl.create_default_context(),
+    ) as server:
+        server.login(username, password)
+        server.send_message(message)
 
     logging.info("邮件发送成功：%s", recipient)
 
 
+# ==================== 主程序 ====================
+
 def main():
+    now = datetime.now(BEIJING)
+    logging.info("北京时间：%s", now.isoformat())
+
+    # 测试邮件不依赖 CNN 接口，先单独验证邮件配置。
     if FORCE:
-        logging.warning("当前为强制发送模式：即使未触发阈值也会发送邮件")
-
-    data, score = get_data()
-    color, zone_name = zone_of(score)
-    logging.info("CNN 指数：%.1f；区间：%s", score, zone_name)
-
-    triggered = score <= LOW or score >= HIGH
-    if not triggered and not FORCE:
-        logging.info("指数未触发阈值，不发送邮件")
+        test_html = """
+        <html><body style="font-family:Arial,sans-serif;padding:24px">
+        <h2>CNN Fear &amp; Greed Alert</h2>
+        <p>测试邮件发送成功。</p>
+        <p>邮件服务配置可用；这封邮件不代表当前指数已触发阈值。</p>
+        </body></html>
+        """
+        send_mail(
+            "[测试] CNN 恐惧与贪婪指数邮件系统",
+            "测试邮件发送成功。此邮件不代表指数已触发阈值。",
+            test_html,
+            {},
+        )
         return
 
+    data, score = get_data()
+
+    logging.info("当前 CNN 指数：%.2f", score)
+
+    # 严格阈值：小于 25 或大于 75。
+    if not (score < LOW or score > HIGH):
+        logging.info("指数未触发阈值，不发送邮件。")
+        return
+
+    color, label = zone_of(score)
     images = {"gauge": gauge_png(score)}
+
     trend = trend_png(data)
     if trend:
         images["trend"] = trend
 
-    if score <= LOW:
-        subject = f"⚠️ CNN 恐惧与贪婪指数低位提醒：{score:.1f}"
-    elif score >= HIGH:
-        subject = f"🔥 CNN 恐惧与贪婪指数高位提醒：{score:.1f}"
+    if score < LOW:
+        emoji = "⚠️"
+        direction = "低位恐惧提醒"
     else:
-        subject = f"[测试] CNN 恐惧与贪婪指数简报：{score:.1f}"
+        emoji = "🔥"
+        direction = "高位贪婪提醒"
+
+    subject = f"{emoji} 美股情绪提醒：{score:.1f}｜{direction}"
 
     plain = (
         f"CNN 恐惧与贪婪指数：{score:.1f}/100\n"
-        f"情绪区间：{zone_name}\n"
-        f"检查时间：{datetime.now(BEIJING):%Y-%m-%d %H:%M} 北京时间\n"
-        f"提醒阈值：≤{LOW} 或 ≥{HIGH}\n"
-        "本邮件仅供市场情绪参考，不构成投资建议。"
+        f"情绪区间：{label}\n"
+        f"北京时间：{now:%Y-%m-%d %H:%M:%S}\n"
+        f"触发条件：指数严格低于 {LOW} 或严格高于 {HIGH}\n"
+        "本邮件仅供参考，不构成投资建议。"
     )
 
-    html = build_html(data, score, images)
+    html = build_html(data, score, "trend" in images)
+
     send_mail(subject, plain, html, images)
 
 
