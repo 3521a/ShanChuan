@@ -7,11 +7,19 @@ SOURCE = os.getenv("FNG_SOURCE", "cnn")
 # 测试成功后,要改回 LOW, HIGH = 25, 75
 LOW, HIGH = 100, 0
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://edition.cnn.com",
+    "Referer": "https://edition.cnn.com/markets/fear-and-greed",
+}
+
 def get_index():
     if SOURCE == "cnn":
         r = requests.get(
             "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+            headers=HEADERS, timeout=30)
         r.raise_for_status()
         d = r.json()["fear_and_greed"]
         return round(d["score"]), d["rating"]
