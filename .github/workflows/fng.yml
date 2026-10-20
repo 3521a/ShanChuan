@@ -1,3 +1,4 @@
+```yaml
 name: CNN Fear and Greed Alert
 
 on:
@@ -6,13 +7,17 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "测试模式：无论指数多少都发送邮件"
+        description: "测试模式：即使未触发阈值也发送邮件"
         required: true
         type: boolean
         default: false
 
 permissions:
   contents: read
+
+concurrency:
+  group: cnn-fear-greed-alert
+  cancel-in-progress: false
 
 jobs:
   alert:
@@ -27,9 +32,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install dependencies
-        run: pip install requests matplotlib
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests matplotlib
 
       - name: Check index and send email
         env:
@@ -37,4 +45,5 @@ jobs:
           MAIL_USER: ${{ secrets.MAIL_USER }}
           MAIL_PASS: ${{ secrets.MAIL_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-        run: python fng_alert.py
+        run: python -u fng_alert.py
+```
