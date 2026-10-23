@@ -42,9 +42,9 @@ HEADERS = {
 }
 
 SYMBOLS = {
-    "SPY": "标普500市值加权 ETF",
-    "RSP": "标普500等权重 ETF",
-    "^VIX": "VIX 波动率指数",
+    "SPY": ("SPY", "标普500市值加权 ETF"),
+    "RSP": ("RSP", "标普500等权重 ETF"),
+    "^VIX": ("VIX", "CBOE 波动率指数"),
 }
 
 # 七项 CNN 完整核心子指标，保留动态 keys 解析和备用键名
@@ -128,28 +128,36 @@ def pct_text(value):
 
 def pct_color(value):
     if value is None or value == 0:
-        return "#667085"
+        return "#64748b"
 
-    return "#16804a" if value > 0 else "#c62828"
+    return "#15803d" if value > 0 else "#b91c1c"
+
+
+def pct_bg(value):
+    if value is None or value == 0:
+        return "#f1f5f9"
+
+    return "#dcfce7" if value > 0 else "#fee2e2"
 
 
 def zone(score):
+    """返回 (状态名, 主色, 浅色徽章背景, 深色徽章文字)"""
     if score is None:
-        return "数据缺失", "#98a2b3"
+        return "数据缺失", "#94a3b8", "#f1f5f9", "#475569"
 
     if score < 25:
-        return "极度恐惧", "#f04438"
+        return "极度恐惧", "#ef4444", "#fef2f2", "#b91c1c"
 
     if score < 45:
-        return "恐惧", "#f79009"
+        return "恐惧", "#f97316", "#fff7ed", "#c2410c"
 
     if score <= 55:
-        return "中性", "#98a2b3"
+        return "中性", "#64748b", "#f1f5f9", "#334155"
 
     if score <= 75:
-        return "贪婪", "#32d583"
+        return "贪婪", "#22c55e", "#f0fdf4", "#15803d"
 
-    return "极度贪婪", "#12b76a"
+    return "极度贪婪", "#10b981", "#ecfdf5", "#047857"
 
 
 def parse_time(value):
@@ -404,23 +412,23 @@ def get_history(data):
 
 
 # ============================================================
-# 近一年走势图：纯 HTML/CSS 原生绘制（收件箱列表外面绝不显示图片药丸，点进去直接显示白底蓝线图）
+# 近一年走势图：纯 HTML/CSS 原生绘制（零图片附件、自适应手机/电脑宽度）
 # ============================================================
 
 def make_chart_html(history):
     """
-    使用纯 HTML table + CSS 渲染白底蓝线走势图（含 25/50/75 虚线参考线与浅蓝底部填充）：
+    使用纯 HTML table + CSS 渲染白底蓝线走势图（含 25/50/75 虚线参考线、浅蓝底部填充、最高/最低点统计栏）：
     1. 不产生任何 MIME 图片附件或内联资源（收件箱列表外面绝对不会出现 fear_and_greed_chart.png 图标）
     2. 不使用 base64 <img>（不会被 Gmail / Outlook 拦截或出现裂图图标）
-    3. 点进邮件正文直接呈现清晰的白底细蓝线走势图
+    3. 采用百分比自适应列宽与紧凑日期格式，在手机窄屏与电脑宽屏下均清晰平滑
     """
     if not history or len(history) < 2:
         logging.warning("历史数据不足，无法生成走势图")
         return None
 
     try:
-        # 采样 120 个数据点，兼顾平滑细蓝线走势与极小 HTML 体积（总大小仅 ~32KB，远低于 Gmail 102KB 限制）
-        max_points = 120
+        # 采样 112 个数据点，在 iPhone 375px 窄屏（约 2.6px/列）与桌面端（约 5.8px/列）都清晰连贯
+        max_points = 112
         if len(history) > max_points:
             step = (len(history) - 1) / (max_points - 1)
             sampled = [
@@ -436,6 +444,11 @@ def make_chart_html(history):
         y_25 = int(round((100.0 - 75.0) / 100.0 * chart_h))  # 75分参考线距顶距离 (37px)
         y_50 = int(round((100.0 - 50.0) / 100.0 * chart_h))  # 50分参考线距顶距离 (74px)
         y_75 = int(round((100.0 - 25.0) / 100.0 * chart_h))  # 25分参考线距顶距离 (111px)
+
+        all_scores = [float(p["score"]) for p in history]
+        min_pt = min(history, key=lambda x: x["score"])
+        max_pt = max(history, key=lambda x: x["score"])
+        avg_score = sum(all_scores) / len(all_scores)
 
         cols = []
         for i, pt in enumerate(sampled):
@@ -471,7 +484,7 @@ def make_chart_html(history):
                     continue
 
                 if a >= line_top and b <= line_bottom:
-                    cls = "c-hl" if i == n - 1 else "c-ln"
+                    cls = "c-hl" if i >= n - 2 else "c-ln"
                 elif is_dash_col and (
                     (a == y_25 and b == y_25 + 1)
                     or (a == y_50 and b == y_50 + 1)
@@ -487,20 +500,20 @@ def make_chart_html(history):
 
             cols.append(f'<td class="c-td">{"".join(segs)}</td>')
 
-        # 底部 6 个等距月份标签
-        label_count = 6
+        # 底部 5 个等距月份标签（采用紧凑 YY/MM 格式，防止手机窄屏换行挤压）
+        label_count = 5
         label_tds = []
         for k in range(label_count):
             idx = round(k * (n - 1) / (label_count - 1))
-            dt_str = sampled[idx]["date"].strftime("%Y-%m")
+            dt_str = sampled[idx]["date"].strftime("%y/%m")
             align = (
                 "left"
                 if k == 0
                 else ("right" if k == label_count - 1 else "center")
             )
             label_tds.append(
-                f'<td style="font-size:10px;color:#64748b;'
-                f'text-align:{align};padding-top:6px">{dt_str}</td>'
+                f'<td style="font-size:10px;color:#64748b;font-family:Consolas,Menlo,monospace;'
+                f'text-align:{align};padding-top:6px;white-space:nowrap">{dt_str}</td>'
             )
 
         q_h = chart_h // 4
@@ -508,20 +521,37 @@ def make_chart_html(history):
 
         return (
             '<div style="margin-top:10px;background:#ffffff;'
-            'border-radius:8px;padding:12px 12px 8px">'
+            'border-radius:10px;padding:12px 12px 10px;border:1px solid #1e293b">'
+            # 图表顶部迷你统计条（最高 / 均值 / 最低）
+            '<table role="presentation" style="width:100%;border-collapse:collapse;margin-bottom:8px">'
+            "<tr>"
+            '<td style="font-size:11px;color:#475569;text-align:left">'
+            f'近1年低点 <strong style="color:#dc2626">{min_pt["score"]:.1f}</strong> '
+            f'<span style="color:#94a3b8">({min_pt["date"]:%y/%m/%d})</span>'
+            "</td>"
+            '<td style="font-size:11px;color:#475569;text-align:center">'
+            f'均值 <strong style="color:#0f172a">{avg_score:.1f}</strong>'
+            "</td>"
+            '<td style="font-size:11px;color:#475569;text-align:right">'
+            f'近1年高点 <strong style="color:#16a34a">{max_pt["score"]:.1f}</strong> '
+            f'<span style="color:#94a3b8">({max_pt["date"]:%y/%m/%d})</span>'
+            "</td>"
+            "</tr>"
+            "</table>"
+            # 图表主体
             '<table role="presentation" style="width:100%;'
             'border-collapse:collapse;table-layout:fixed">'
             "<tr>"
-            '<td style="width:24px;vertical-align:top;padding-right:5px">'
-            f'<div style="height:{q_h}px;font-size:9px;color:#94a3b8;text-align:right;line-height:1">100</div>'
-            f'<div style="height:{q_h}px;font-size:9px;color:#94a3b8;text-align:right;line-height:1">75</div>'
-            f'<div style="height:{q_h}px;font-size:9px;color:#94a3b8;text-align:right;line-height:1">50</div>'
-            f'<div style="height:{r_h}px;font-size:9px;color:#94a3b8;text-align:right;line-height:1">25</div>'
+            '<td style="width:22px;vertical-align:top;padding-right:4px">'
+            f'<div style="height:{q_h}px;font-size:9px;color:#94a3b8;text-align:right;line-height:1;font-family:Consolas,monospace">100</div>'
+            f'<div style="height:{q_h}px;font-size:9px;color:#16a34a;text-align:right;line-height:1;font-family:Consolas,monospace">75</div>'
+            f'<div style="height:{q_h}px;font-size:9px;color:#94a3b8;text-align:right;line-height:1;font-family:Consolas,monospace">50</div>'
+            f'<div style="height:{r_h}px;font-size:9px;color:#dc2626;text-align:right;line-height:1;font-family:Consolas,monospace">25</div>'
             "</td>"
             '<td style="vertical-align:top">'
             '<table role="presentation" style="width:100%;'
             "border-collapse:collapse;table-layout:fixed;"
-            'border-bottom:1px solid #d1d5db">'
+            'border-bottom:1px solid #cbd5e1;border-top:1px solid #f1f5f9">'
             f"<tr>{''.join(cols)}</tr>"
             "</table>"
             '<table role="presentation" style="width:100%;'
@@ -688,7 +718,7 @@ def get_market_data():
 
 def analyze_market(score, market, history=None):
     notes = []
-    label, _ = zone(score)
+    label, _, _, _ = zone(score)
 
     if score < LOW:
         notes.append(
@@ -787,7 +817,7 @@ def analyze_market(score, market, history=None):
         or spy.get("daily") is None
         or spy.get("week") is None
     ):
-        title, color = "行情数据不足，暂不判断", "#98a2b3"
+        title, color = "行情数据不足，暂不判断", "#94a3b8"
 
     elif spy["daily"] > 0 and spy["week"] > 0:
         if (
@@ -807,7 +837,7 @@ def analyze_market(score, market, history=None):
             )
 
         else:
-            title, color = "价格偏强，仍待确认", "#32d583"
+            title, color = "价格偏强，仍待确认", "#34d399"
 
     elif spy["daily"] < 0 and spy["week"] < 0:
         title, color = "价格偏弱", "#fb7185"
@@ -824,49 +854,68 @@ def analyze_market(score, market, history=None):
 
 
 # ============================================================
-# HTML 邮件组件
+# HTML 邮件组件（自适应手机竖屏与电脑宽屏）
 # ============================================================
 
-def table_row(cells, header=False):
-    background = "#f2f4f7" if header else "#ffffff"
-    weight = "700" if header else "400"
+def badge_pill(text, bg_color, text_color):
+    return (
+        f'<span style="display:inline-block;padding:2px 8px;'
+        f'border-radius:999px;background:{bg_color};color:{text_color};'
+        f'font-size:11px;font-weight:600;line-height:1.4;white-space:nowrap">'
+        f"{escape(text)}</span>"
+    )
+
+
+def table_row(cells, header=False, aligns=None):
+    background = "#f8fafc" if header else "#ffffff"
+    weight = "600" if header else "400"
+    text_color = "#475569" if header else "#0f172a"
+    border_color = "#e2e8f0" if header else "#f1f5f9"
+
+    tds = []
+    for idx, cell in enumerate(cells):
+        align = (
+            aligns[idx]
+            if aligns and idx < len(aligns)
+            else ("left" if idx == 0 else "right")
+        )
+        tds.append(
+            f'<td class="m-cell" style="padding:10px 8px;'
+            f"border-bottom:1px solid {border_color};"
+            f"font-size:12px;color:{text_color};text-align:{align};"
+            f'vertical-align:middle;line-height:1.45">{cell}</td>'
+        )
 
     return (
         f'<tr style="background:{background};font-weight:{weight}">'
-        + "".join(
-            '<td style="padding:9px 7px;'
-            'border-bottom:1px solid #eaecf0;'
-            'font-size:12px;vertical-align:top">'
-            f"{cell}</td>"
-            for cell in cells
-        )
+        + "".join(tds)
         + "</tr>"
     )
 
 
 def section(title, subtitle=""):
     return (
-        '<div style="padding:22px 0 10px">'
-        f'<div style="font-size:17px;font-weight:700;'
-        f'color:#101828">{escape(title)}</div>'
-        f'<div style="font-size:12px;color:#667085;'
-        f'margin-top:4px">{escape(subtitle)}</div>'
+        '<div style="padding:2px 0 12px;border-bottom:1px solid #f1f5f9;margin-bottom:8px">'
+        f'<div style="font-size:16px;font-weight:700;'
+        f'color:#0f172a;letter-spacing:0.2px">{escape(title)}</div>'
+        f'<div style="font-size:12px;color:#64748b;'
+        f'margin-top:3px">{escape(subtitle)}</div>'
         "</div>"
     )
 
 
 def metric_card(title, value, subtitle, color):
     return f"""
-    <td style="width:50%;padding:5px;vertical-align:top">
-      <div style="border:1px solid #26364f;border-radius:10px;padding:12px">
-        <div style="font-size:12px;color:#aab8cf">
+    <td class="stack-col" style="width:50%;padding:5px;vertical-align:top">
+      <div style="background:#131d31;border:1px solid #26364f;border-radius:12px;padding:14px 14px 12px">
+        <div style="font-size:11px;color:#94a3b8;letter-spacing:0.5px">
           {escape(title)}
         </div>
-        <div style="font-size:22px;font-weight:bold;color:{color};
-        margin-top:6px;overflow-wrap:anywhere">
+        <div class="hero-val" style="font-size:22px;font-weight:700;color:{color};
+        margin-top:6px;line-height:1.25;overflow-wrap:anywhere">
           {escape(str(value))}
         </div>
-        <div style="font-size:12px;color:#aab8cf;margin-top:5px">
+        <div style="font-size:12px;color:#cbd5e1;margin-top:6px;line-height:1.4">
           {escape(str(subtitle))}
         </div>
       </div>
@@ -874,14 +923,14 @@ def metric_card(title, value, subtitle, color):
     """
 
 
-def progress_bar(score):
-    _, color = zone(score)
+def progress_bar(score, track_bg="#26364f", height=8):
+    _, color, _, _ = zone(score)
 
     return (
-        '<div style="height:9px;background:#26364f;'
-        'border-radius:8px;overflow:hidden">'
-        f'<div style="height:9px;width:{score:.1f}%;'
-        f'background:{color}"></div>'
+        f'<div style="height:{height}px;background:{track_bg};'
+        f'border-radius:999px;overflow:hidden">'
+        f'<div style="height:{height}px;width:{score:.1f}%;'
+        f'background:{color};border-radius:999px"></div>'
         "</div>"
     )
 
@@ -901,7 +950,7 @@ def build_email(
     timestamp,
 ):
     now = datetime.now(BEIJING)
-    label, score_color = zone(score)
+    label, score_color, _, _ = zone(score)
 
     title, title_color, notes = analyze_market(
         score,
@@ -911,7 +960,7 @@ def build_email(
 
     fg = data.get("fear_and_greed", {})
 
-    # 历史情绪对比
+    # 1. 历史情绪对比
     historical_rows = []
 
     for label_text, key in [
@@ -921,101 +970,144 @@ def build_email(
         ("一年前", "previous_1_year"),
     ]:
         value = valid_score(fg.get(key))
-        rating, color = zone(value)
+        rating, _, bg_c, txt_c = zone(value)
         diff = (score - value) if value is not None else None
-        diff_str = (
-            f'<span style="color:{pct_color(diff)}">{diff:+.1f}</span>'
-            if diff is not None
+
+        if diff is not None:
+            diff_str = (
+                f'<span style="font-family:Consolas,Menlo,monospace;font-weight:600;'
+                f'color:{pct_color(diff)}">{diff:+.1f}</span>'
+            )
+        else:
+            diff_str = "—"
+
+        val_str = (
+            f'<span style="font-family:Consolas,Menlo,monospace;font-weight:600;color:#0f172a">'
+            f"{fmt_number(value, 1)}</span>"
+            if value is not None
             else "—"
         )
 
         historical_rows.append(
-            table_row([
-                escape(label_text),
-                (
-                    fmt_number(value, 1)
-                    if value is not None
-                    else "—"
-                ),
-                diff_str,
-                f'<span style="color:{color}">'
-                f"{escape(rating)}</span>",
-            ])
+            table_row(
+                [
+                    f'<span style="font-weight:500;color:#334155">{escape(label_text)}</span>',
+                    val_str,
+                    diff_str,
+                    badge_pill(rating, bg_c, txt_c),
+                ],
+                aligns=["left", "right", "right", "right"],
+            )
         )
 
-    # 核心子指标
+    # 2. 七项核心子指标（将进度条嵌在指标名称下方，在手机窄屏与桌面端都宽敞清晰）
     component_rows = []
 
     for component in components:
         value = component["score"]
-        rating, color = zone(value)
+        rating, color, bg_c, txt_c = zone(value)
 
         if value is not None:
             value_html = (
-                f'<span style="color:{color};font-weight:bold">'
+                f'<span style="font-family:Consolas,Menlo,monospace;'
+                f'color:{color};font-weight:700;font-size:13px">'
                 f"{value:.1f}</span>"
             )
-            bar_html = progress_bar(value)
+            bar_html = progress_bar(value, track_bg="#e2e8f0", height=6)
         else:
             value_html = "—"
-            bar_html = "—"
+            bar_html = (
+                '<div style="height:6px;background:#f1f5f9;'
+                'border-radius:999px"></div>'
+            )
 
-        component_rows.append(
-            table_row([
-                escape(component["label"]),
-                bar_html,
-                value_html,
-                f'<span style="color:{color}">'
-                f"{escape(rating)}</span>",
-            ])
+        name_and_bar = (
+            f'<div style="font-weight:600;color:#1e293b;font-size:12px;'
+            f'margin-bottom:6px">{escape(component["label"])}</div>'
+            f"{bar_html}"
         )
 
-    # SPY、RSP、VIX 行情
+        component_rows.append(
+            table_row(
+                [
+                    name_and_bar,
+                    value_html,
+                    badge_pill(rating, bg_c, txt_c),
+                ],
+                aligns=["left", "right", "right"],
+            )
+        )
+
+    # 3. SPY、RSP、VIX 行情（代码与中文名上下分层，避免手机端挤压换行）
     market_rows = []
     market_dates = []
 
-    for symbol, label_text in SYMBOLS.items():
+    for symbol, (short_code, cn_name) in SYMBOLS.items():
         item = market.get(symbol)
+
+        symbol_cell = (
+            f'<div style="font-weight:700;color:#0f172a;font-size:13px;'
+            f'font-family:Consolas,Menlo,monospace">{escape(short_code)}</div>'
+            f'<div style="font-size:11px;color:#64748b;margin-top:1px">'
+            f"{escape(cn_name)}</div>"
+        )
 
         if not item:
             market_rows.append(
-                table_row([
-                    escape(label_text),
-                    "—",
-                    "—",
-                    "—",
-                    "—",
-                    "数据不可用",
-                ])
+                table_row(
+                    [
+                        symbol_cell,
+                        "—",
+                        "—",
+                        "—",
+                        '<span style="color:#94a3b8;font-size:11px">不可用</span>',
+                    ],
+                    aligns=["left", "right", "right", "right", "right"],
+                )
             )
             continue
 
-        market_dates.append(
-            f"{symbol}: {item['date']}"
+        market_dates.append(f"{short_code}: {item['date']}")
+
+        def fmt_pct_pill(val):
+            if val is None:
+                return "—"
+            return (
+                f'<span style="display:inline-block;padding:2px 6px;border-radius:6px;'
+                f"background:{pct_bg(val)};color:{pct_color(val)};"
+                f'font-family:Consolas,Menlo,monospace;font-size:11px;font-weight:600;white-space:nowrap">'
+                f"{pct_text(val)}</span>"
+            )
+
+        def fmt_pct_plain(val):
+            if val is None:
+                return "—"
+            return (
+                f'<span style="color:{pct_color(val)};font-family:Consolas,Menlo,monospace;'
+                f'font-size:12px;font-weight:600;white-space:nowrap">{pct_text(val)}</span>'
+            )
+
+        price_html = (
+            f'<div style="font-family:Consolas,Menlo,monospace;font-weight:700;'
+            f'color:#0f172a;font-size:13px">{fmt_number(item["price"])}</div>'
+            f'<div style="font-size:10px;color:#94a3b8;margin-top:1px">{escape(item["date"][5:])}</div>'
         )
 
         market_rows.append(
-            table_row([
-                escape(label_text),
-                fmt_number(item["price"]),
-                (
-                    f'<span style="color:{pct_color(item["daily"])}">'
-                    f'{pct_text(item["daily"])}</span>'
-                ),
-                (
-                    f'<span style="color:{pct_color(item["week"])}">'
-                    f'{pct_text(item["week"])}</span>'
-                ),
-                (
-                    f'<span style="color:{pct_color(item["month"])}">'
-                    f'{pct_text(item["month"])}</span>'
-                ),
-                escape(item["date"]),
-            ])
+            table_row(
+                [
+                    symbol_cell,
+                    price_html,
+                    fmt_pct_pill(item["daily"]),
+                    fmt_pct_plain(item["week"]),
+                    fmt_pct_plain(item["month"]),
+                ],
+                aligns=["left", "right", "right", "right", "right"],
+            )
         )
 
     notes_html = "".join(
-        f"<li style='margin:0 0 8px;line-height:1.65'>"
+        f"<li style='margin:0 0 8px;line-height:1.65;color:#334155;font-size:13px'>"
         f"{escape(note)}</li>"
         for note in notes
     )
@@ -1043,135 +1135,177 @@ def build_email(
             for key, value in errors.items()
         )
         if errors
-        else "本次行情请求均已返回"
+        else "本次行情请求均已正常返回"
+    )
+
+    # 隐藏的收件箱预览摘要（确保手机与电脑收件箱列表外面看到的摘要永远干净一致）
+    preheader_text = (
+        f"DAILY MARKET BRIEF CNN 恐惧与贪婪指数 生成时间：{now:%Y-%m-%d %H:%M:%S}（北京时间） "
+        f"当前指数 {score:.1f} / 100 {label} 市场监测 {title} 规则型观察，不是买卖指令"
     )
 
     html = f"""<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="x-apple-disable-message-reformatting">
+<meta name="format-detection" content="telephone=no,date=no,address=no,email=no">
 <style>
+/* 图表紧凑样式类 */
 .c-td {{ padding:0; margin:0; vertical-align:top; }}
 .c-ln {{ background:#1683c4; font-size:0; line-height:0; }}
 .c-hl {{ background:#0284c7; font-size:0; line-height:0; }}
 .c-gd {{ background:#cbd5e1; font-size:0; line-height:0; }}
 .c-fl {{ background:#f0f7ff; font-size:0; line-height:0; }}
 .c-bg {{ background:#ffffff; font-size:0; line-height:0; }}
+
+/* 手机端自适应响应式布局 */
+@media only screen and (max-width: 600px) {{
+  .outer-wrap {{ padding: 8px 6px !important; }}
+  .hero-box {{ padding: 16px 12px !important; border-radius: 12px !important; }}
+  .card-box {{ padding: 14px 12px !important; border-radius: 10px !important; }}
+  .stack-col {{ display: block !important; width: 100% !important; box-sizing: border-box !important; padding: 4px 0 !important; }}
+  .hero-title {{ font-size: 20px !important; }}
+  .hero-val {{ font-size: 20px !important; }}
+  .m-cell {{ padding: 8px 5px !important; font-size: 11px !important; }}
+}}
 </style>
 </head>
-<body style="margin:0;padding:12px;background:#f2f4f7;color:#101828;font-family:Arial,'Microsoft YaHei',sans-serif">
+<body style="margin:0;padding:0;background:#f1f5f9;color:#0f172a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%">
 
-<div style="max-width:760px;margin:0 auto">
+<!-- 隐藏预览文本：固定收件箱列表外部显示的文字摘要 -->
+<div style="display:none;max-height:0;max-width:0;opacity:0;overflow:hidden;mso-hide:all;font-size:1px;line-height:1px;color:#f1f5f9">
+  {escape(preheader_text)}&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;
+</div>
+
+<div class="outer-wrap" style="max-width:720px;margin:0 auto;padding:16px 12px">
 
   <!-- 深色 Hero 卡片 -->
-  <div style="background:#0b1220;color:#f8fafc;border-radius:14px;padding:20px 16px;margin-bottom:14px">
+  <div class="hero-box" style="background:#0b1220;color:#f8fafc;border-radius:16px;padding:22px 18px;margin-bottom:14px;box-shadow:0 4px 12px rgba(15,23,42,0.08)">
 
-    <div style="font-size:11px;letter-spacing:2px;color:#94a3b8">
-      DAILY MARKET BRIEF
-    </div>
+    <table role="presentation" style="width:100%;border-collapse:collapse">
+      <tr>
+        <td style="font-size:11px;letter-spacing:1.8px;color:#94a3b8;font-weight:600">
+          DAILY MARKET BRIEF
+        </td>
+        <td style="font-size:11px;color:#64748b;text-align:right;font-family:Consolas,Menlo,monospace">
+          {now:%Y-%m-%d %H:%M} BJT
+        </td>
+      </tr>
+    </table>
 
-    <div style="font-size:23px;line-height:1.3;font-weight:700;margin-top:8px">
+    <div class="hero-title" style="font-size:23px;line-height:1.3;font-weight:700;margin-top:8px;color:#ffffff">
       CNN 恐惧与贪婪指数
     </div>
 
-    <div style="font-size:12px;color:#94a3b8;margin-top:7px">
+    <div style="font-size:12px;color:#94a3b8;margin-top:5px">
       生成时间：{now:%Y-%m-%d %H:%M:%S}（北京时间）
     </div>
 
     <table role="presentation" style="width:100%;border-collapse:collapse;margin-top:14px">
       <tr>
-        {metric_card("当前指数", f"{score:.1f} / 100", label, score_color)}
+        {metric_card("当前指数", f"{score:.1f} / 100", f"当前处于「{label}」区间", score_color)}
         {metric_card("市场监测", title, "规则型观察，不是买卖指令", title_color)}
       </tr>
     </table>
 
-    <div style="font-size:12px;color:#cbd5e1;margin:12px 1px 8px">
-      指数区间
+    <!-- 五档色带与当前进度 -->
+    <div style="margin-top:14px;background:#131d31;border:1px solid #26364f;border-radius:10px;padding:10px 12px">
+      <table role="presentation" style="width:100%;border-collapse:collapse;margin-bottom:6px">
+        <tr>
+          <td style="font-size:11px;color:#cbd5e1;font-weight:600">情绪区间位置</td>
+          <td style="font-size:11px;color:{score_color};text-align:right;font-weight:700;font-family:Consolas,Menlo,monospace">{score:.1f}% · {escape(label)}</td>
+        </tr>
+      </table>
+
+      {progress_bar(score, track_bg="#26364f", height=9)}
+
+      <table role="presentation" style="width:100%;border-collapse:collapse;margin-top:6px;table-layout:fixed">
+        <tr>
+          <td style="font-size:10px;color:#ef4444;text-align:left">0 极度恐惧</td>
+          <td style="font-size:10px;color:#f97316;text-align:center">25 恐惧</td>
+          <td style="font-size:10px;color:#94a3b8;text-align:center">50 中性</td>
+          <td style="font-size:10px;color:#22c55e;text-align:center">75 贪婪</td>
+          <td style="font-size:10px;color:#10b981;text-align:right">100 极度贪婪</td>
+        </tr>
+      </table>
     </div>
 
-    {progress_bar(score)}
-
-    <div style="font-size:10px;color:#94a3b8;margin-top:6px">
-      0 极度恐惧　　50 中性　　100 极度贪婪
-    </div>
-
-    <div style="font-size:14px;font-weight:600;color:#f8fafc;margin-top:20px">
-      近一年情绪走势
-    </div>
+    <table role="presentation" style="width:100%;border-collapse:collapse;margin-top:18px">
+      <tr>
+        <td style="font-size:14px;font-weight:700;color:#f8fafc">近一年情绪走势</td>
+        <td style="font-size:11px;color:#94a3b8;text-align:right">共 {len(history)} 个交易日数据点</td>
+      </tr>
+    </table>
 
     {chart_html}
 
     <div style="font-size:11px;color:#94a3b8;margin-top:8px;line-height:1.5">
       蓝线为 CNN 指数历史走势；浅灰虚线为 25、50、75 参考阈值。
-      CNN数据时间：{escape(timestamp.isoformat())}
+      CNN数据时间：{escape(timestamp.strftime("%Y-%m-%d %H:%M UTC"))}
     </div>
 
   </div>
 
-  <!-- 历史情绪对比 -->
-  <div style="background:#ffffff;border:1px solid #eaecf0;border-radius:12px;padding:16px;margin-bottom:14px">
+  <!-- 一、历史情绪对比 -->
+  <div class="card-box" style="background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;padding:16px;margin-bottom:14px">
     {section("一、历史情绪对比", "CNN接口提供的历史参考值与当前读数差值")}
 
     <table role="presentation" style="width:100%;border-collapse:collapse">
-      {table_row(["时间", "历史指数", "较当时变化", "当时状态"], True)}
+      {table_row(["时间节点", "历史指数", "较当时变化", "当时状态"], True, ["left", "right", "right", "right"])}
       {''.join(historical_rows)}
     </table>
   </div>
 
-  <!-- 核心子指标 -->
-  <div style="background:#ffffff;border:1px solid #eaecf0;border-radius:12px;padding:16px;margin-bottom:14px">
-    {section("二、核心子指标", "CNN 构成子指标；缺失项显示为—")}
+  <!-- 二、核心子指标 -->
+  <div class="card-box" style="background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;padding:16px;margin-bottom:14px">
+    {section("二、核心子指标", "CNN 7项构成指标及分项情绪水位")}
 
     <table role="presentation" style="width:100%;border-collapse:collapse">
-      {table_row(["指标", "区间", "分数", "状态"], True)}
+      {table_row(["构成指标与水位", "分数", "状态"], True, ["left", "right", "right"])}
       {''.join(component_rows)}
     </table>
   </div>
 
-  <!-- 行情 -->
-  <div style="background:#ffffff;border:1px solid #eaecf0;border-radius:12px;padding:16px;margin-bottom:14px">
+  <!-- 三、市场行情 -->
+  <div class="card-box" style="background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;padding:16px;margin-bottom:14px">
     {section("三、市场行情", "SPY市值加权、RSP等权重、VIX波动率")}
 
-    <div style="overflow-wrap:anywhere">
-      <table role="presentation" style="width:100%;border-collapse:collapse">
-        {table_row(["标的", "最新收盘", "日涨跌", "约一周", "约一月", "日期"], True)}
-        {''.join(market_rows)}
-      </table>
-    </div>
+    <table role="presentation" style="width:100%;border-collapse:collapse">
+      {table_row(["标的", "最新收盘", "日涨跌", "约一周", "约一月"], True, ["left", "right", "right", "right", "right"])}
+      {''.join(market_rows)}
+    </table>
 
-    <div style="font-size:11px;color:#667085;margin-top:8px;line-height:1.6">
+    <div style="font-size:11px;color:#64748b;margin-top:10px;line-height:1.6">
       各标的交易日期：{escape(data_dates)}。
       约一周按5个交易日间隔计算，约一月按21个交易日间隔计算。
       SPY与RSP收益差可提供市场广度线索，但不能替代完整市场宽度统计。
     </div>
   </div>
 
-  <!-- 分析 -->
-  <div style="background:#ffffff;border:1px solid #eaecf0;border-radius:12px;padding:16px;margin-bottom:14px">
+  <!-- 四、市场分析 -->
+  <div class="card-box" style="background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;padding:16px;margin-bottom:14px">
     {section("四、市场分析", "将价格、情绪与波动率分开观察")}
 
-    <div style="font-size:17px;font-weight:700;color:{title_color};margin-bottom:10px">
+    <div style="display:inline-block;padding:4px 10px;border-radius:8px;background:#0f172a;color:{title_color};font-size:14px;font-weight:700;margin-bottom:12px">
       {escape(title)}
     </div>
 
-    <ul style="padding-left:20px;margin:0">
+    <ul style="padding-left:18px;margin:0">
       {notes_html}
     </ul>
   </div>
 
-  <!-- 数据说明 -->
-  <div style="background:#ffffff;border:1px solid #eaecf0;border-radius:12px;padding:16px">
-    {section("五、数据与风险提示", "数据缺失时尽量降级显示")}
+  <!-- 五、数据与风险提示 -->
+  <div class="card-box" style="background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;padding:16px">
+    {section("五、数据与风险提示", "数据来源与运行参数说明")}
 
-    <div style="font-size:12px;line-height:1.8;color:#475467">
-      <div>CNN页面：<a href="{CNN_PAGE}">{CNN_PAGE}</a></div>
-      <div>CNN接口：{CNN_URL}</div>
-      <div>行情来源：Yahoo Finance日线数据</div>
-      <div>行情状态：{escape(error_text)}</div>
-      <div>提醒阈值：指数严格低于{LOW:g}或严格高于{HIGH:g}时发送（FORCE_SEND=true 时强制发送）</div>
-      <div>说明：CNN底层接口并非承诺长期稳定的公共API；走势图采用纯 HTML/CSS 原生绘制，兼容所有邮件客户端且不在收件箱列表外露附件芯片。</div>
-      <div>本报告仅供研究参考，不构成投资建议。</div>
+    <div style="font-size:12px;line-height:1.85;color:#475569;overflow-wrap:anywhere">
+      <div>• <strong>CNN页面</strong>：<a href="{CNN_PAGE}" style="color:#0284c7;text-decoration:none">{CNN_PAGE}</a></div>
+      <div>• <strong>行情来源</strong>：Yahoo Finance 日线数据（{escape(error_text)}）</div>
+      <div>• <strong>提醒阈值</strong>：指数严格低于 {LOW:g} 或严格高于 {HIGH:g} 时发送（FORCE_SEND=true 时强制发送）</div>
+      <div>• <strong>免责声明</strong>：本报告由自动化程序生成，仅供个人研究参考，不构成任何投资或交易建议。</div>
     </div>
   </div>
 
