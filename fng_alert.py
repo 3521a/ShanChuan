@@ -1,85 +1,82 @@
 import os
+import json
 import time
 import ssl
+import base64
 import smtplib
 import logging
+from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from email.header import Header
 from html import escape
 
 import requests
+import matplotlib
+matplotlib.use("Agg")  # 无头模式，适合服务器运行
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
-# ==================== 配置 ====================
+# =========================================================
+# 配置
+# =========================================================
 LOW = 25
 HIGH = 75
 BEIJING = timezone(timedelta(hours=8))
 FORCE = os.getenv("FORCE_SEND", "false").lower() == "true"
 
-CNN_PAGE = "https://edition.cnn.com/markets/fear-and-greed"
 CNN_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/"
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": CNN_PAGE,
+    "Referer": "https://edition.cnn.com/",
 }
 
-COMPONENTS = {
-    "market_momentum_sp500": "标普500市场动量",
-    "stock_price_strength": "股价强度",
-    "stock_price_breadth": "股价广度",
-    "put_call_options": "看跌/看涨期权",
-    "market_volatility_vix": "市场波动率",
-    "safe_haven_demand": "避险需求",
-    "junk_bond_demand": "垃圾债需求",
-}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-SYMBOLS = {
-    "SPY": "标普500 ETF",
-    "VOO": "先锋标普500 ETF",
-    "IVV": "iShares标普500 ETF",
-    "RSP": "标普500等权重ETF",
-    "^VIX": "VIX波动率指数",
-}
+# =========================================================
+# 情绪分区
+# =========================================================
+ZONES = [
+    (25,  "极度恐惧", "#dc2626", "#fef2f2"),
+    (45,  "恐惧",     "#f97316", "#fff7ed"),
+    (55,  "中性",     "#6b7280", "#f3f4f6"),
+    (75,  "贪婪",     "#10b981", "#ecfdf5"),
+    (101, "极度贪婪", "#059669", "#ecfdf5"),
+]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+def zone(score):
+    for limit, label, color, bg in ZONES:
+        if score < limit:
+            return label, color, bg
+    return "极度贪婪", "#059669", "#ecfdf5"
 
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-
-
-# ==================== 通用函数 ====================
 def valid_score(value):
     try:
         value = float(value)
-        if 0 <= value <= 100 and value == value:
+        if 0 <= value <= 100:
             return value
     except (TypeError, ValueError):
         pass
     return None
 
-
 def number(value, digits=2):
     try:
-        value = float(value)
-        if value != value or abs(value) == float("inf"):
+        x = float(value)
+        if x != x or abs(x) == float("inf"):
             return "—"
-        return f"{value:,.{digits}f}"
+        return f"{x:,.{digits}f}"
     except (TypeError, ValueError):
         return "—"
 
-
-def pct(current, previous):
+def pct_change(current, previous):
     try:
         current, previous = float(current), float(previous)
         if previous == 0:
@@ -88,625 +85,370 @@ def pct(current, previous):
     except (TypeError, ValueError):
         return None
 
-
 def pct_text(value):
-    return "—" if value is None else f"{value:+.2f}%"
-
+    return f"{value:+.2f}%" if value is not None else "—"
 
 def pct_color(value):
-    if value is None or value == 0:
-        return "#667085"
-    return "#16804a" if value > 0 else "#c62828"
+    if value is None: return "#94a3b8"
+    return "#059669" if value > 0 else "#dc2626" if value < 0 else "#64748b"
 
-
-def zone(score):
-    if score < 25:
-        return "极度恐惧", "#c62828"
-    if score < 45:
-        return "恐惧", "#e67e22"
-    if score <= 55:
-        return "中性", "#667085"
-    if score <= 75:
-        return "贪婪", "#39845a"
-    return "极度贪婪", "#16733c"
-
-
-def parse_time(value):
-    if not value:
-        return None
-    try:
-        result = datetime.fromisoformat(
-            str(value).replace("Z", "+00:00")
-        )
-        if result.tzinfo is None:
-            result = result.replace(tzinfo=timezone.utc)
-        return result
-    except (TypeError, ValueError):
-        return None
-
-
-def get_json(url, params=None, timeout=25):
-    response = SESSION.get(url, params=params, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-# ==================== CNN官方数据 ====================
+# =========================================================
+# 获取 CNN 数据（含历史走势）
+# =========================================================
 def get_cnn_data():
     last_error = None
-
     for attempt in range(3):
         try:
-            data = get_json(CNN_URL)
-            if not isinstance(data, dict):
-                raise ValueError("CNN响应不是有效JSON对象")
+            resp = requests.get(CNN_URL, headers=HEADERS, timeout=25)
+            resp.raise_for_status()
+            data = resp.json()
 
-            fg = data.get("fear_and_greed")
-            if not isinstance(fg, dict):
-                raise ValueError("CNN响应缺少fear_and_greed")
-
-            score = valid_score(fg.get("score"))
+            score = valid_score((data.get("fear_and_greed") or {}).get("score"))
             if score is None:
-                raise ValueError("CNN指数缺失或数值无效")
+                raise ValueError("CNN 响应中没有有效指数")
 
-            timestamp = parse_time(fg.get("timestamp"))
-            if timestamp is None:
-                raise ValueError("CNN指数缺少有效更新时间")
+            # 解析近一年历史数据
+            history = []
+            hist_data = (data.get("fear_and_greed_historical") or {}).get("data", [])
+            for point in hist_data:
+                try:
+                    ts = int(point.get("x")) / 1000
+                    val = float(point.get("y"))
+                    dt = datetime.fromtimestamp(ts, tz=BEIJING)
+                    history.append((dt, val))
+                except (TypeError, ValueError, KeyError):
+                    continue
 
-            now = datetime.now(timezone.utc)
-
-            if timestamp > now + timedelta(hours=2):
-                raise ValueError("CNN数据时间异常：时间戳位于未来")
-
-            if timestamp < now - timedelta(days=10):
-                raise ValueError("CNN数据时间异常：数据可能已过期")
-
-            components = {}
-            for key in COMPONENTS:
-                item = data.get(key)
-                value = (
-                    valid_score(item.get("score"))
-                    if isinstance(item, dict)
-                    else None
-                )
-                components[key] = value
-
-            logging.info(
-                "CNN指数=%.2f，更新时间=%s，子指标=%s/7",
-                score,
-                timestamp.isoformat(),
-                sum(v is not None for v in components.values()),
-            )
-
-            return data, score, components
+            logging.info("CNN 指数：%.2f，历史数据点：%d", score, len(history))
+            return data, score, history
 
         except Exception as exc:
             last_error = exc
-            logging.warning(
-                "CNN请求第%d次失败：%s", attempt + 1, exc
-            )
+            logging.warning("CNN 请求第 %s/3 次失败：%s", attempt + 1, exc)
             if attempt < 2:
                 time.sleep(2 ** attempt)
 
-    raise RuntimeError(
-        "无法获取并验证CNN指数，停止本次报告。"
-    ) from last_error
+    raise RuntimeError("无法获取 CNN 指数") from last_error
 
+# =========================================================
+# 生成走势图（base64 内联）
+# =========================================================
+def generate_trend_chart(history):
+    if not history:
+        return None
 
-# ==================== Yahoo行情 ====================
-def get_yahoo_data(symbol):
-    payload = get_json(
-        f"{YAHOO_URL}{symbol}",
-        params={
-            "range": "3mo",
-            "interval": "1d",
-            "events": "div,splits",
-        },
-        timeout=20,
-    )
+    dates = [h[0] for h in history]
+    scores = [h[1] for h in history]
 
-    chart = payload.get("chart", {})
-    if chart.get("error"):
-        raise ValueError(f"Yahoo返回错误：{chart['error']}")
+    fig, ax = plt.subplots(figsize=(8, 2.6), dpi=150)
+    fig.patch.set_facecolor("#0f172a")
+    ax.set_facecolor("#0f172a")
 
-    results = chart.get("result")
-    if not results:
-        raise ValueError(f"{symbol}没有行情数据")
+    # 阈值线
+    ax.axhline(y=LOW, color="#ef4444", linewidth=0.8, linestyle="--", alpha=0.6)
+    ax.axhline(y=HIGH, color="#10b981", linewidth=0.8, linestyle="--", alpha=0.6)
 
-    item = results[0]
+    # 走势线
+    ax.plot(dates, scores, color="#38bdf8", linewidth=1.5, alpha=0.9)
+
+    # 填充
+    ax.fill_between(dates, scores, LOW, where=[s >= LOW for s in scores],
+                    color="#38bdf8", alpha=0.1, interpolate=True)
+    ax.fill_between(dates, scores, LOW, where=[s < LOW for s in scores],
+                    color="#ef4444", alpha=0.15, interpolate=True)
+
+    # 格式
+    ax.set_ylim(0, 100)
+    ax.set_yticks([0, 25, 50, 75, 100])
+    ax.tick_params(colors="#64748b", labelsize=7)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    ax.grid(axis="y", color="#1e293b", linewidth=0.6)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    plt.tight_layout(pad=1.2)
+    buf = BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    b64 = base64.b64encode(buf.read()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
+
+# =========================================================
+# 获取 Yahoo 行情（精简：去掉 VOO / IVV）
+# =========================================================
+def get_yahoo_chart(symbol, range_value="3mo"):
+    resp = requests.get(f"{YAHOO_CHART_URL}{symbol}",
+                        params={"range": range_value, "interval": "1d"},
+                        headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    result = (resp.json().get("chart", {}) or {}).get("result")
+    if not result:
+        raise ValueError(f"{symbol} 没有可用行情")
+
+    item = result[0]
     timestamps = item.get("timestamp") or []
-    quotes = item.get("indicators", {}).get("quote") or []
+    quote = ((item.get("indicators") or {}).get("quote") or [{}])[0]
+    closes = quote.get("close") or []
 
-    if not timestamps or not quotes:
-        raise ValueError(f"{symbol}行情结构不完整")
-
-    closes = quotes[0].get("close") or []
     points = []
-
     for i, ts in enumerate(timestamps):
         if i >= len(closes) or closes[i] is None:
             continue
-
         try:
-            close = float(closes[i])
-            if close <= 0:
-                continue
-
-            points.append({
-                "timestamp": int(ts),
-                "close": close,
-            })
-        except (ValueError, TypeError):
+            points.append({"timestamp": int(ts), "close": float(closes[i])})
+        except (TypeError, ValueError):
             continue
 
-    points.sort(key=lambda x: x["timestamp"])
-
-    if len(points) < 22:
-        raise ValueError(f"{symbol}有效日线不足22条")
+    if not points:
+        raise ValueError(f"{symbol} 没有有效收盘价")
 
     latest = points[-1]
-    previous = points[-2]
+    prev = points[-2] if len(points) >= 2 else None
 
-    def trailing_return(intervals):
-        return pct(
-            points[-1]["close"],
-            points[-(intervals + 1)]["close"],
-        )
-
-    # Yahoo日线时间戳通常对应交易日开始时间；
-    # 使用交易所时区确定交易日期，避免北京时间跨日误标。
-    meta = item.get("meta") or {}
-    exchange_tz = meta.get(
-        "exchangeTimezoneName", "America/New_York"
-    )
-
-    try:
-        from zoneinfo import ZoneInfo
-        latest_dt = datetime.fromtimestamp(
-            latest["timestamp"], timezone.utc
-        ).astimezone(ZoneInfo(exchange_tz))
-    except Exception:
-        latest_dt = datetime.fromtimestamp(
-            latest["timestamp"], timezone.utc
-        )
+    def trailing(days):
+        return pct_change(latest["close"], points[-(days + 1)]["close"]) if len(points) > days else None
 
     return {
         "symbol": symbol,
         "price": latest["close"],
-        "daily": pct(
-            latest["close"], previous["close"]
-        ),
-        "week": trailing_return(5),
-        "month": trailing_return(21),
-        "date": latest_dt.strftime("%Y-%m-%d"),
-        "points": points,
+        "daily_return": pct_change(latest["close"], prev["close"]) if prev else None,
+        "week_return": trailing(5),
+        "month_return": trailing(21),
+        "date": datetime.fromtimestamp(latest["timestamp"], tz=BEIJING).strftime("%Y-%m-%d"),
     }
 
-
 def get_market_data():
-    market, errors = {}, {}
-
-    for symbol in SYMBOLS:
+    symbols = {"SPY": "标普 500 ETF", "RSP": "等权重标普 500", "^VIX": "VIX 波动率"}
+    result, errors = {}, {}
+    for symbol, name in symbols.items():
         try:
-            market[symbol] = get_yahoo_data(symbol)
-            logging.info(
-                "%s: %s，日期=%s",
-                symbol,
-                market[symbol]["price"],
-                market[symbol]["date"],
-            )
+            result[symbol] = get_yahoo_chart(symbol)
+            result[symbol]["name"] = name
         except Exception as exc:
             errors[symbol] = str(exc)
-            logging.warning("%s行情失败：%s", symbol, exc)
+            logging.warning("%s 行情失败：%s", symbol, exc)
+    return result, errors
 
-    return market, errors
-
-
-# ==================== 市场分析 ====================
-def analyze_market(score, market):
-    spy = market.get("SPY")
-    rsp = market.get("RSP")
-    vix = market.get("^VIX")
-
-    notes = []
-
-    if score < 25:
-        notes.append(
-            f"CNN指数为{score:.1f}，处于极度恐惧区间。"
-            "情绪极端不代表市场已经见底。"
-        )
-    elif score > 75:
-        notes.append(
-            f"CNN指数为{score:.1f}，处于极度贪婪区间。"
-            "情绪极端不代表市场必然马上反转。"
-        )
-    else:
-        notes.append(
-            f"CNN指数为{score:.1f}，未处于极端区间。"
-            "需结合价格、波动率及市场广度判断。"
-        )
-
-    spy_day = spy.get("daily") if spy else None
-    spy_week = spy.get("week") if spy else None
-    vix_day = vix.get("daily") if vix else None
-
-    # 比较收益率，而不是比较ETF单份价格
-    if (
-        spy and rsp
-        and spy.get("week") is not None
-        and rsp.get("week") is not None
-    ):
-        gap = rsp["week"] - spy["week"]
-
-        if gap > 1:
-            notes.append(
-                f"RSP近一周收益领先SPY {gap:.2f}个百分点，"
-                "等权重组合相对占优，但不等于资金净流入。"
-            )
-        elif gap < -1:
-            notes.append(
-                f"SPY近一周收益领先RSP {abs(gap):.2f}个百分点，"
-                "市值加权组合相对占优，需留意权重集中度。"
-            )
-        else:
-            notes.append(
-                "SPY与RSP近一周表现接近，"
-                "暂未发现明显的相对强弱分化。"
-            )
-
-    if vix_day is None:
-        notes.append("VIX行情不可用，无法判断当日波动率变化。")
-    elif vix_day >= 5:
-        notes.append(
-            f"VIX单日上涨{vix_day:.2f}%，风险定价升温。"
-            "即使股价上涨，也不能据此认定市场风险下降。"
-        )
-    elif vix_day <= -5:
-        notes.append(
-            f"VIX单日下跌{vix_day:.2f}%，波动率有所回落，"
-            "仍需观察后续变化。"
-        )
-    else:
-        notes.append(
-            "VIX当日变化未达到正负5%的提示阈值，"
-            "需结合绝对水平及持续趋势判断。"
-        )
-
-    # 价格上涨不再自动等同于短期强势
-    if spy_day is None or spy_week is None:
-        title, color = "数据不足，暂不判断", "#667085"
-    elif spy_day > 0 and spy_week > 0:
-        if vix_day is not None and vix_day >= 5:
-            title = "价格上涨，但风险定价升温"
-            color = "#b26a00"
-        elif score < 25:
-            title = "价格偏强，情绪仍极度恐惧"
-            color = "#b26a00"
-        else:
-            title = "价格偏强，仍待确认"
-            color = "#16804a"
-    elif spy_day < 0 and spy_week < 0:
-        title, color = "价格偏弱", "#c62828"
-    else:
-        title, color = "价格趋势分化", "#b26a00"
-
-    notes.append(
-        "价格变化、市场情绪和资金流是不同概念。"
-        "本报告不把ETF涨跌或成交量直接解释为净申购赎回。"
-    )
-
-    return title, color, notes
-
-
-# ==================== 邮件HTML组件 ====================
-def table_row(cells, header=False):
-    bg = "#f2f4f7" if header else "#ffffff"
-    weight = "700" if header else "400"
-
+# =========================================================
+# HTML 组件
+# =========================================================
+def render_progress(score, color, height=6):
+    pct = max(0, min(100, float(score)))
     return (
-        f'<tr style="background:{bg};font-weight:{weight}">'
-        + "".join(
-            '<td style="padding:9px 7px;border-bottom:1px solid '
-            '#eaecf0;font-size:12px;vertical-align:top">'
-            f'{cell}</td>'
-            for cell in cells
-        )
-        + "</tr>"
+        f'<div style="background:#e5e7eb;border-radius:99px;height:{height}px;overflow:hidden;width:100%">'
+        f'<div style="background:{color};height:{height}px;width:{pct:.1f}%;border-radius:99px"></div></div>'
     )
 
-
-def section(title, subtitle=""):
-    return (
-        '<div style="padding:22px 0 10px">'
-        f'<div style="font-size:17px;font-weight:700">'
-        f'{escape(title)}</div>'
-        f'<div style="font-size:12px;color:#667085">'
-        f'{escape(subtitle)}</div></div>'
-    )
-
-
-def metric_card(title, value, subtitle, color):
+def hero_card(score, label, color, chart_b64):
+    chart_html = f'<div style="margin-top:24px"><img src="{chart_b64}" alt="近一年走势" style="width:100%;border-radius:8px;display:block"></div>' if chart_b64 else ""
     return f"""
-    <td style="width:50%;padding:6px;vertical-align:top">
-      <div style="border:1px solid #e5e7eb;border-radius:10px;padding:14px">
-        <div style="font-size:12px;color:#667085">{escape(title)}</div>
-        <div style="font-size:22px;font-weight:bold;color:{color};margin-top:6px">
-          {escape(str(value))}
-        </div>
-        <div style="font-size:12px;color:#667085;margin-top:5px">
-          {escape(str(subtitle))}
-        </div>
+    <div style="background-color:#0f172a;background-image:linear-gradient(135deg,#1e293b 0%,#0f172a 100%);border-radius:20px;padding:32px 28px;color:#ffffff">
+      <div style="font-size:11px;letter-spacing:3px;color:#94a3b8;text-transform:uppercase;font-weight:600">CNN FEAR &amp; GREED INDEX</div>
+      <div style="margin-top:18px">
+        <span style="font-size:64px;font-weight:800;line-height:1;color:#ffffff;letter-spacing:-2px">{score:.1f}</span>
+        <span style="font-size:20px;color:#94a3b8;font-weight:500"> / 100</span>
       </div>
-    </td>
+      <div style="margin-top:16px">
+        <span style="display:inline-block;padding:6px 14px;background-color:{color};color:#ffffff;border-radius:99px;font-size:13px;font-weight:600">{label}</span>
+      </div>
+      <div style="margin-top:22px">{render_progress(score, color, 10)}</div>
+      {chart_html}
+    </div>
     """
 
+# 精简后的子指标（去掉重叠项）
+INDICATOR_DEFS = [
+    {"display": "市场动量", "keys": ["market_momentum_sp500", "market_momentum_sp125"]},
+    {"display": "市场广度", "keys": ["stock_price_breadth"]},
+    {"display": "市场波动率", "keys": ["market_volatility_vix"]},
+    {"display": "垃圾债需求", "keys": ["junk_bond_demand"]},
+]
 
-def progress_bar(score):
-    _, color = zone(score)
-    return (
-        '<div style="height:8px;background:#edf0f4;'
-        'border-radius:8px;overflow:hidden;min-width:65px">'
-        f'<div style="height:8px;width:{score:.1f}%;'
-        f'background:{color}"></div></div>'
-    )
+def extract_indicator(data, keys):
+    for key in keys:
+        item = data.get(key)
+        if isinstance(item, dict):
+            score = valid_score(item.get("score"))
+            if score is not None:
+                return {"score": score, "rating": item.get("rating") or ""}
+    return None
 
+def indicators_card(data):
+    rows = ""
+    for item in INDICATOR_DEFS:
+        info = extract_indicator(data, item["keys"])
+        if info:
+            label, color, _ = zone(info["score"])
+            rows += f"""
+            <tr>
+              <td style="padding:12px 0;border-bottom:1px solid #f1f5f9;font-size:13px;color:#0f172a;font-weight:600">{escape(item['display'])}</td>
+              <td style="padding:12px 8px;border-bottom:1px solid #f1f5f9;width:40%">{render_progress(info['score'], color, 6)}</td>
+              <td style="padding:12px 0;border-bottom:1px solid #f1f5f9;width:44px;text-align:right;font-size:15px;font-weight:700;color:{color}">{info['score']:.0f}</td>
+            </tr>
+            """
+    return f"""
+    <div style="background:#ffffff;border-radius:20px;padding:24px;margin-top:16px;box-shadow:0 1px 3px rgba(15,23,42,0.04)">
+      <div style="font-size:14px;font-weight:700;color:#0f172a">核心子指标</div>
+      <div style="font-size:11px;color:#94a3b8;margin-top:4px;margin-bottom:6px">精简展示 CNN 驱动指数的关键维度</div>
+      <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">{rows}</table>
+    </div>
+    """
 
-# ==================== 生成日报 ====================
-def build_email(data, score, components, market, errors):
+def market_card(market):
+    rows = ""
+    for symbol in ["SPY", "RSP", "^VIX"]:
+        info = market.get(symbol)
+        if not info:
+            rows += f'<tr><td colspan="4" style="padding:10px 0;font-size:12px;color:#94a3b8">行情暂不可用</td></tr>'
+            continue
+        daily, week, month = info.get("daily_return"), info.get("week_return"), info.get("month_return")
+        rows += f"""
+        <tr>
+          <td style="padding:10px 0;border-bottom:1px solid #f1f5f9;font-size:13px;color:#0f172a;font-weight:600">{escape(info['name'])}</td>
+          <td style="padding:10px 4px;border-bottom:1px solid #f1f5f9;text-align:right;font-size:13px;font-weight:600">{number(info.get('price'))}</td>
+          <td style="padding:10px 4px;border-bottom:1px solid #f1f5f9;text-align:right;font-size:12px;color:{pct_color(daily)}">{pct_text(daily)}</td>
+          <td style="padding:10px 4px;border-bottom:1px solid #f1f5f9;text-align:right;font-size:12px;color:{pct_color(week)}">{pct_text(week)}</td>
+          <td style="padding:10px 4px;border-bottom:1px solid #f1f5f9;text-align:right;font-size:12px;color:{pct_color(month)}">{pct_text(month)}</td>
+        </tr>
+        """
+    return f"""
+    <div style="background:#ffffff;border-radius:20px;padding:24px;margin-top:16px;box-shadow:0 1px 3px rgba(15,23,42,0.04)">
+      <div style="font-size:14px;font-weight:700;color:#0f172a">关键行情对比</div>
+      <div style="font-size:11px;color:#94a3b8;margin-top:4px;margin-bottom:14px">SPY（市值加权） vs RSP（等权重）</div>
+      <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
+        <tr>
+          <td style="padding:8px 0;font-size:11px;color:#64748b;border-bottom:1px solid #e2e8f0;font-weight:600">标的</td>
+          <td style="padding:8px 4px;font-size:11px;color:#64748b;border-bottom:1px solid #e2e8f0;font-weight:600;text-align:right">最新</td>
+          <td style="padding:8px 4px;font-size:11px;color:#64748b;border-bottom:1px solid #e2e8f0;font-weight:600;text-align:right">日</td>
+          <td style="padding:8px 4px;font-size:11px;color:#64748b;border-bottom:1px solid #e2e8f0;font-weight:600;text-align:right">周</td>
+          <td style="padding:8px 4px;font-size:11px;color:#64748b;border-bottom:1px solid #e2e8f0;font-weight:600;text-align:right">月</td>
+        </tr>
+        {rows}
+      </table>
+    </div>
+    """
+
+def analysis_card(score, market):
+    notes = []
+    if score < LOW:
+        notes.append("指数位于极度恐惧区间，情绪极端不代表市场已经见底。")
+    elif score > HIGH:
+        notes.append("指数位于极度贪婪区间，需留意拥挤交易与回撤风险。")
+    else:
+        notes.append("指数未处于极端区间，仍需结合趋势与波动率判断。")
+
+    spy, rsp = market.get("SPY"), market.get("RSP")
+    if spy and rsp and spy.get("week_return") is not None and rsp.get("week_return") is not None:
+        gap = spy["week_return"] - rsp["week_return"]
+        if gap > 1.0:
+            notes.append("SPY 周表现明显强于 RSP，上涨可能集中于大型权重股。")
+        elif gap < -1.0:
+            notes.append("RSP 周表现强于 SPY，等权重占优，上涨参与度可能更广。")
+
+    vix = market.get("^VIX")
+    if vix and vix.get("daily_return") is not None:
+        if vix["daily_return"] > 5:
+            notes.append("VIX 单日涨幅较大，风险定价升温。")
+        elif vix["daily_return"] < -5:
+            notes.append("VIX 单日跌幅较大，短期压力有所缓和。")
+
+    notes.append("以上为自动规则生成的观察线索，不构成买卖指令。")
+
+    items = "".join(f'<li style="margin:0 0 8px;line-height:1.7;font-size:13px;color:#334155">{escape(n)}</li>' for n in notes)
+    return f"""
+    <div style="background:#ffffff;border-radius:20px;padding:24px;margin-top:16px;box-shadow:0 1px 3px rgba(15,23,42,0.04)">
+      <div style="font-size:14px;font-weight:700;color:#0f172a">市场观察</div>
+      <div style="font-size:11px;color:#94a3b8;margin-top:4px;margin-bottom:14px">规则型分析，仅供参考</div>
+      <ul style="padding-left:18px;margin:0">{items}</ul>
+    </div>
+    """
+
+# =========================================================
+# 邮件生成
+# =========================================================
+def build_email(data, score, market):
     now = datetime.now(BEIJING)
-    fg = data["fear_and_greed"]
-    label, score_color = zone(score)
-    title, title_color, notes = analyze_market(score, market)
-
-    history = []
-    for name, key in [
-        ("昨日收盘", "previous_close"),
-        ("一周前", "previous_1_week"),
-        ("一个月前", "previous_1_month"),
-        ("一年前", "previous_1_year"),
-    ]:
-        value = valid_score(fg.get(key))
-        if value is None:
-            history.append(
-                table_row([name, "—", "暂无数据"])
-            )
-        else:
-            rating, color = zone(value)
-            history.append(table_row([
-                name,
-                f'<span style="color:{color};font-weight:bold">'
-                f'{value:.1f}</span>',
-                f'<span style="color:{color}">{rating}</span>',
-            ]))
-
-    component_rows = []
-    count = 0
-
-    for key, name in COMPONENTS.items():
-        value = components.get(key)
-
-        if value is None:
-            component_rows.append(
-                table_row([escape(name), "—", "—", "本次无有效数据"])
-            )
-            continue
-
-        count += 1
-        rating, color = zone(value)
-
-        component_rows.append(table_row([
-            escape(name),
-            progress_bar(value),
-            f'<span style="color:{color};font-weight:bold">'
-            f'{value:.1f}</span>',
-            f'<span style="color:{color}">{rating}</span>',
-        ]))
-
-    market_rows = []
-    market_dates = []
-
-    for symbol, name in SYMBOLS.items():
-        item = market.get(symbol)
-
-        if not item:
-            market_rows.append(
-                table_row([
-                    escape(name), "—", "—", "—", "—", "行情不可用"
-                ])
-            )
-            continue
-
-        market_dates.append(f"{symbol}: {item['date']}")
-
-        market_rows.append(table_row([
-            escape(name),
-            number(item["price"]),
-            f'<span style="color:{pct_color(item["daily"])}">'
-            f'{pct_text(item["daily"])}</span>',
-            f'<span style="color:{pct_color(item["week"])}">'
-            f'{pct_text(item["week"])}</span>',
-            f'<span style="color:{pct_color(item["month"])}">'
-            f'{pct_text(item["month"])}</span>',
-            escape(item["date"]),
-        ]))
-
-    notes_html = "".join(
-        f"<li style='margin-bottom:8px;line-height:1.7'>"
-        f"{escape(note)}</li>"
-        for note in notes
-    )
-
-    timestamp = escape(
-        str(fg.get("timestamp") or "CNN未提供更新时间")
-    )
-    dates_text = "；".join(market_dates) or "行情不可用"
-    error_text = (
-        "；".join(f"{k}: {v}" for k, v in errors.items())
-        if errors else "本次请求的行情均已返回"
-    )
+    label, color, _ = zone(score)
+    chart_b64 = generate_trend_chart(data.get("_history", []))
 
     html = f"""<!doctype html>
-<html>
-<head><meta charset="utf-8"></head>
-<body style="margin:0;background:#f2f4f7;padding:16px;
-font-family:Arial,'Microsoft YaHei',sans-serif;color:#202832">
-<div style="max-width:760px;margin:auto;background:#fff;
-border:1px solid #e4e7ec;border-radius:12px;overflow:hidden">
-
-<div style="background:#202832;color:#fff;padding:24px">
-<div style="font-size:11px;letter-spacing:2px">DAILY MARKET BRIEF</div>
-<div style="font-size:23px;font-weight:bold;margin-top:10px">美股市场风险监测</div>
-<div style="font-size:12px;margin-top:8px">
-邮件生成时间：{now:%Y-%m-%d %H:%M:%S}（北京时间）</div>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:24px 12px;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;color:#0f172a">
+<div style="max-width:640px;margin:0 auto">
+  <div style="padding:0 8px 14px;display:flex;justify-content:space-between;align-items:center">
+    <div>
+      <div style="font-size:11px;letter-spacing:3px;color:#94a3b8;text-transform:uppercase;font-weight:600">DAILY BRIEF</div>
+      <div style="font-size:18px;font-weight:700;color:#0f172a;margin-top:2px">美股风险监测</div>
+    </div>
+    <div style="font-size:11px;color:#94a3b8;text-align:right">{now:%Y-%m-%d %H:%M}<br>北京时间</div>
+  </div>
+  {hero_card(score, label, color, chart_b64)}
+  {indicators_card(data)}
+  {market_card(market)}
+  {analysis_card(score, market)}
+  <div style="padding:22px 8px;text-align:center;font-size:11px;color:#94a3b8;line-height:1.8">
+    CNN 数据时间：{escape(str((data.get('fear_and_greed') or {}).get('timestamp') or '—'))}<br>
+    触发阈值：严格低于 {LOW} 或严格高于 {HIGH}<br>
+    本报告仅供研究参考，不构成投资建议。
+  </div>
 </div>
+</body></html>"""
 
-<div style="padding:20px">
-<table style="width:100%;border-collapse:collapse"><tr>
-{metric_card("CNN恐惧与贪婪指数", f"{score:.1f}/100", label, score_color)}
-{metric_card("综合监测结论", title, "规则型观察，不是买卖指令", title_color)}
-</tr></table>
+    plain = f"""美股风险监测
+生成时间：{now:%Y-%m-%d %H:%M:%S}（北京时间）
+CNN 恐惧与贪婪指数：{score:.1f}/100（{label}）
 
-<div style="margin-top:16px;padding:15px;background:#f8fafc;border:1px solid #eaecf0;border-radius:9px">
-<div style="font-size:12px;color:#667085">指数位置</div>
-<div style="height:10px;background:#edf0f4;border-radius:8px;margin-top:12px;overflow:hidden">
-<div style="height:10px;width:{score:.1f}%;background:{score_color}"></div>
-</div>
-<div style="display:flex;justify-content:space-between;font-size:11px;color:#667085;margin-top:6px">
-<span>0 极度恐惧</span><span>50 中性</span><span>100 极度贪婪</span>
-</div></div>
+市场观察：
+- 指数位于{label}区间。
+- SPY 与 RSP 的周表现对比见邮件正文。
+- 本报告仅供参考，不构成投资建议。
+"""
+    return plain, html
 
-{section("一、历史情绪对比", "CNN接口返回的历史参考值")}
-<table style="width:100%;border-collapse:collapse">
-{table_row(["时间", "指数", "情绪"], True)}
-{''.join(history)}
-</table>
-
-{section("二、标普500与波动率", "Yahoo日线数据；各标的交易日期分别列示")}
-<div style="overflow-wrap:anywhere"><table style="width:100%;border-collapse:collapse">
-{table_row(["标的", "最新收盘", "日涨跌", "约一周", "约一月", "日期"], True)}
-{''.join(market_rows)}
-</table></div>
-<div style="font-size:11px;color:#667085;margin-top:7px;line-height:1.6">
-各标的日期：{escape(dates_text)}。约一周按5个交易日间隔计算，约一月按21个交易日间隔计算。
-ETF单份价格不能直接比较强弱，应比较相同时间区间的收益率。VIX不是可直接买入的股票资产。
-</div>
-
-{section("三、CNN七项子指标", f"本次取得{count}/7项有效分数；缺失值不作推测")}
-<table style="width:100%;border-collapse:collapse">
-{table_row(["指标", "区间", "分数", "状态"], True)}
-{''.join(component_rows)}
-</table>
-
-{section("四、市场分析", "分别观察价格、情绪与波动率")}
-<div style="padding:16px;background:#f8fafc;border:1px solid #eaecf0;border-radius:9px">
-<div style="font-size:18px;font-weight:bold;color:{title_color}">{escape(title)}</div>
-<ul style="padding-left:20px">{notes_html}</ul>
-</div>
-
-{section("五、资金流向", "不把价格变化冒充资金流")}
-<div style="font-size:13px;line-height:1.8">
-<p>本报告比较SPY、VOO、IVV和RSP的价格表现。</p>
-<p><b>注意：</b>ETF价格涨跌和成交量不等于净申购赎回。本版本没有接入经过核验的每日ETF份额变化或基金净流量数据，因此不报告净流入/流出金额。</p>
-</div>
-
-{section("六、数据来源与完整性")}
-<div style="font-size:11px;line-height:1.8;color:#667085">
-<div>CNN官方页面：<a href="{CNN_PAGE}">{CNN_PAGE}</a></div>
-<div>CNN数据接口：{CNN_URL}</div>
-<div>CNN数据时间：{timestamp}</div>
-<div>行情来源：Yahoo Finance日线接口。</div>
-<div>行情状态：{escape(error_text)}</div>
-<div>提醒阈值：严格低于{LOW}或严格高于{HIGH}时发送。</div>
-<div>注意：CNN底层接口不是正式承诺长期稳定的公共API。</div>
-<div>本报告仅供研究参考，不构成投资建议。</div>
-</div>
-</div></div></body></html>"""
-
-    plain = (
-        "美股市场风险监测\n"
-        f"生成时间：{now:%Y-%m-%d %H:%M:%S}（北京时间）\n\n"
-        f"CNN恐惧与贪婪指数：{score:.1f}/100（{label}）\n"
-        f"综合监测结论：{title}\n\n"
-        "市场观察：\n"
-        + "\n".join(f"- {note}" for note in notes)
-        + f"\n\nCNN数据时间：{timestamp}\n"
-        f"行情日期：{dates_text}\n"
-        f"行情状态：{error_text}\n\n"
-        "资金流说明：ETF价格涨跌和成交量不等于净申购赎回。\n"
-        "本报告仅供研究参考，不构成投资建议。\n"
-    )
-
-    return plain, html, title
-
-
-# ==================== 发送邮件 ====================
+# =========================================================
+# 发送邮件
+# =========================================================
 def send_email(subject, plain, html):
-    username = os.environ.get("MAIL_USER")
-    password = os.environ.get("MAIL_PASS")
-    recipient = os.environ.get("MAIL_TO")
+    username, password, recipient = os.environ.get("MAIL_USER"), os.environ.get("MAIL_PASS"), os.environ.get("MAIL_TO")
+    if not all([username, password, recipient]):
+        raise RuntimeError("邮件配置不完整")
 
-    if not username or not password or not recipient:
-        raise RuntimeError(
-            "邮件配置不完整，请检查MAIL_USER、MAIL_PASS、MAIL_TO"
-        )
+    msg = EmailMessage()
+    msg["Subject"] = str(Header(subject, "utf-8"))
+    msg["From"], msg["To"] = username, recipient
+    msg.set_content(plain)
+    msg.add_alternative(html, subtype="html")
 
-    message = EmailMessage()
-    message["Subject"] = str(Header(subject, "utf-8"))
-    message["From"] = username
-    message["To"] = recipient
-    message.set_content(plain)
-    message.add_alternative(html, subtype="html")
-
-    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    port = int(os.getenv("SMTP_PORT", "465"))
-
-    with smtplib.SMTP_SSL(
-        host,
-        port,
-        timeout=30,
-        context=ssl.create_default_context(),
-    ) as server:
-        server.login(username, password)
-        server.send_message(message)
+    host, port = os.getenv("SMTP_HOST", "smtp.gmail.com"), int(os.getenv("SMTP_PORT", "465"))
+    with smtplib.SMTP_SSL(host, port, timeout=30, context=ssl.create_default_context()) as s:
+        s.login(username, password)
+        s.send_message(msg)
 
     logging.info("邮件发送成功：%s", recipient)
 
-
-# ==================== 主程序 ====================
+# =========================================================
+# 主程序
+# =========================================================
 def main():
-    logging.info("北京时间：%s", datetime.now(BEIJING).isoformat())
-
     if FORCE:
-        send_email(
-            "[测试] 美股市场监测邮件",
-            "邮件系统测试成功。本邮件没有获取实时行情。",
-            "<html><body><h2>美股市场监测测试</h2>"
-            "<p>邮件发送配置可用。本邮件没有获取实时行情。</p>"
-            "</body></html>",
-        )
+        plain = "邮件系统测试成功。\n"
+        html = "<html><body><h2>测试邮件</h2><p>配置可用。</p></body></html>"
+        send_email("[测试] 美股风险监测", plain, html)
         return
 
-    data, score, components = get_cnn_data()
-    market, errors = get_market_data()
+    data, score, history = get_cnn_data()
 
-    # 只在CNN指数进入极端区间时发送
     if not (score < LOW or score > HIGH):
-        logging.info(
-            "CNN指数%.2f，未触发提醒阈值。", score
-        )
+        logging.info("当前指数 %.2f，未触发阈值，不发送提醒。", score)
         return
 
-    plain, html, title = build_email(
-        data, score, components, market, errors
-    )
-
-    if score < LOW:
-        subject = f"[极度恐惧提醒] CNN指数{score:.1f}/100｜{title}"
-    else:
-        subject = f"[极度贪婪提醒] CNN指数{score:.1f}/100｜{title}"
-
+    data["_history"] = history
+    market, _ = get_market_data()
+    plain, html = build_email(data, score, market)
+    subject = f"[{'极度恐惧' if score < LOW else '极度贪婪'}提醒] CNN 指数 {score:.1f}/100"
     send_email(subject, plain, html)
-
 
 if __name__ == "__main__":
     try:
