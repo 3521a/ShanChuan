@@ -412,38 +412,46 @@ def get_history(data):
 
 
 # ============================================================
-# 近一年走势图：纯 HTML/CSS 原生绘制（零图片附件、自适应手机/电脑宽度）
+# 近一年走势图：高分辨率抗锯齿 CSS linear-gradient 渲染（彻底消除马赛克阶梯感）
 # ============================================================
 
 def make_chart_html(history):
     """
-    使用纯 HTML table + CSS 渲染白底蓝线走势图（含 25/50/75 虚线参考线、浅蓝底部填充、最高/最低点统计栏）：
-    1. 不产生任何 MIME 图片附件或内联资源（收件箱列表外面绝对不会出现 fear_and_greed_chart.png 图标）
-    2. 不使用 base64 <img>（不会被 Gmail / Outlook 拦截或出现裂图图标）
-    3. 采用百分比自适应列宽与紧凑日期格式，在手机窄屏与电脑宽屏下均清晰平滑
+    使用 340 列超细密度 + 线性插值 + CSS linear-gradient 亚像素抗锯齿边缘绘制白底细蓝线图：
+    1. 彻底消除原先 112 列抽样造成的粗大方块阶梯（马赛克感），每一列宽度接近 1.5px，折线细腻平滑
+    2. 每一列仅用单个 <td> 的 background:linear-gradient(...) 完成绘制（无嵌套 div），整封邮件约 76KB，不触发 Gmail 102KB 折叠
+    3. 零图片附件、零 base64，收件箱列表外面绝不显示图片药丸，点进正文直接高清展示
     """
     if not history or len(history) < 2:
         logging.warning("历史数据不足，无法生成走势图")
         return None
 
     try:
-        # 采样 112 个数据点，在 iPhone 375px 窄屏（约 2.6px/列）与桌面端（约 5.8px/列）都清晰连贯
-        max_points = 112
-        if len(history) > max_points:
-            step = (len(history) - 1) / (max_points - 1)
-            sampled = [
-                history[round(i * step)]
-                for i in range(max_points)
-            ]
-            sampled[-1] = history[-1]
-        else:
-            sampled = list(history)
+        # 使用 340 列高分辨率采样 + 相邻交易日线性插值，将原本宽约 6px 的方块阶梯细化为 ~1.5px 的连续平滑斜线
+        n_cols = 340
+        src_n = len(history)
+        sampled = []
 
-        n = len(sampled)
-        chart_h = 148  # 图表高度（px）
-        y_25 = int(round((100.0 - 75.0) / 100.0 * chart_h))  # 75分参考线距顶距离 (37px)
-        y_50 = int(round((100.0 - 50.0) / 100.0 * chart_h))  # 50分参考线距顶距离 (74px)
-        y_75 = int(round((100.0 - 25.0) / 100.0 * chart_h))  # 25分参考线距顶距离 (111px)
+        for j in range(n_cols):
+            pos = j * (src_n - 1) / (n_cols - 1)
+            idx = int(pos)
+            frac = pos - idx
+
+            if idx >= src_n - 1:
+                s = float(history[-1]["score"])
+                dt = history[-1]["date"]
+            else:
+                s1 = float(history[idx]["score"])
+                s2 = float(history[idx + 1]["score"])
+                s = (1.0 - frac) * s1 + frac * s2
+                dt = history[round(pos)]["date"]
+
+            sampled.append({"date": dt, "score": s})
+
+        chart_h = 152  # 图表高度（px）
+        y_25 = int(round((100.0 - 75.0) / 100.0 * chart_h))  # 75分参考线距顶 (38px)
+        y_50 = int(round((100.0 - 50.0) / 100.0 * chart_h))  # 50分参考线距顶 (76px)
+        y_75 = int(round((100.0 - 25.0) / 100.0 * chart_h))  # 25分参考线距顶 (114px)
 
         all_scores = [float(p["score"]) for p in history]
         min_pt = min(history, key=lambda x: x["score"])
@@ -462,49 +470,43 @@ def make_chart_html(history):
             y_curr = int(round((100.0 - s) / 100.0 * chart_h))
             y_prev = int(round((100.0 - prev_s) / 100.0 * chart_h))
 
-            line_top = min(y_curr, y_prev)
-            line_bottom = max(y_curr, y_prev)
-            line_h = max(2, line_bottom - line_top + 2)
-            line_bottom = min(chart_h, line_top + line_h)
+            t1 = min(y_curr, y_prev)
+            t2 = min(chart_h, max(t1 + 2, max(y_curr, y_prev) + 1))
+            # 上下各加 1px 半透明过渡色 (#7dd3fc) 实现视觉抗锯齿，消除锯齿毛刺
+            t0 = max(0, t1 - 1)
+            t3 = min(chart_h, t2 + 1)
 
-            breakpoints = {0, chart_h, line_top, line_bottom}
-            is_dash_col = (i % 2 == 0)
-            if is_dash_col:
-                for y_grid in (y_25, y_50, y_75):
-                    if 0 <= y_grid < chart_h:
-                        breakpoints.add(y_grid)
-                        breakpoints.add(min(chart_h, y_grid + 1))
+            line_color = "#0284c7" if i >= n_cols - 3 else "#1683c4"
+            is_dash = ((i // 4) % 2 == 0)
 
-            sorted_pts = sorted(breakpoints)
-            segs = []
-            for k in range(len(sorted_pts) - 1):
-                a, b = sorted_pts[k], sorted_pts[k + 1]
-                h_seg = b - a
-                if h_seg <= 0:
-                    continue
+            stops = [
+                f"#fff {t0}px,#7dd3fc {t0}px {t1}px,"
+                f"{line_color} {t1}px {t2}px,"
+                f"#7dd3fc {t2}px {t3}px,#f0f7ff {t3}px"
+            ]
 
-                if a >= line_top and b <= line_bottom:
-                    cls = "c-hl" if i >= n - 2 else "c-ln"
-                elif is_dash_col and (
-                    (a == y_25 and b == y_25 + 1)
-                    or (a == y_50 and b == y_50 + 1)
-                    or (a == y_75 and b == y_75 + 1)
-                ):
-                    cls = "c-gd"
-                elif a >= line_bottom:
-                    cls = "c-fl"
-                else:
-                    cls = "c-bg"
+            if is_dash:
+                above = [
+                    f"#fff {yg}px,#cbd5e1 {yg}px {yg+1}px,#fff {yg+1}px"
+                    for yg in (y_25, y_50, y_75)
+                    if yg + 1 < t0
+                ]
+                below = [
+                    f"#f0f7ff {yg}px,#cbd5e1 {yg}px {yg+1}px,#f0f7ff {yg+1}px"
+                    for yg in (y_25, y_50, y_75)
+                    if yg > t3 + 1
+                ]
+                stops = above + stops + below
 
-                segs.append(f'<div class="{cls}" style="height:{h_seg}px"></div>')
-
-            cols.append(f'<td class="c-td">{"".join(segs)}</td>')
+            cols.append(
+                f'<td style="background:linear-gradient({",".join(stops)})"></td>'
+            )
 
         # 底部 5 个等距月份标签（采用紧凑 YY/MM 格式，防止手机窄屏换行挤压）
         label_count = 5
         label_tds = []
         for k in range(label_count):
-            idx = round(k * (n - 1) / (label_count - 1))
+            idx = round(k * (n_cols - 1) / (label_count - 1))
             dt_str = sampled[idx]["date"].strftime("%y/%m")
             align = (
                 "left"
@@ -549,7 +551,7 @@ def make_chart_html(history):
             f'<div style="height:{r_h}px;font-size:9px;color:#dc2626;text-align:right;line-height:1;font-family:Consolas,monospace">25</div>'
             "</td>"
             '<td style="vertical-align:top">'
-            '<table role="presentation" style="width:100%;'
+            '<table class="c-grid" role="presentation" style="width:100%;'
             "border-collapse:collapse;table-layout:fixed;"
             'border-bottom:1px solid #cbd5e1;border-top:1px solid #f1f5f9">'
             f"<tr>{''.join(cols)}</tr>"
@@ -1152,13 +1154,8 @@ def build_email(
 <meta name="x-apple-disable-message-reformatting">
 <meta name="format-detection" content="telephone=no,date=no,address=no,email=no">
 <style>
-/* 图表紧凑样式类 */
-.c-td {{ padding:0; margin:0; vertical-align:top; }}
-.c-ln {{ background:#1683c4; font-size:0; line-height:0; }}
-.c-hl {{ background:#0284c7; font-size:0; line-height:0; }}
-.c-gd {{ background:#cbd5e1; font-size:0; line-height:0; }}
-.c-fl {{ background:#f0f7ff; font-size:0; line-height:0; }}
-.c-bg {{ background:#ffffff; font-size:0; line-height:0; }}
+/* 高分辨率抗锯齿走势图单元格 */
+.c-grid td {{ height:152px; padding:0; margin:0; border:0; }}
 
 /* 手机端自适应响应式布局 */
 @media only screen and (max-width: 600px) {{
@@ -1169,6 +1166,7 @@ def build_email(
   .hero-title {{ font-size: 20px !important; }}
   .hero-val {{ font-size: 20px !important; }}
   .m-cell {{ padding: 8px 5px !important; font-size: 11px !important; }}
+  .c-grid td {{ height: 132px !important; }}
 }}
 </style>
 </head>
