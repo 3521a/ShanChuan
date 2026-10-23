@@ -1,13 +1,4 @@
-我已基于 GPT 版本进行了修复和微调，直接给你可以复制运行的完整代码。
 
-核心修改点：
-1. **修复致命 Bug**：将 `HEADERS` 中的 User-Agent 替换为 **Macintosh** 的 UA，避免 CNN 接口返回 418 拦截。
-2. **提升数据稳定性**：将 Yahoo 行情的请求跨度从 `3mo` 改为了 `6mo`，防止因节假日导致交易日数量不足 22 个而触发报错。
-3. **UI 极简优化**：图表保留了纯英文字体（避免 Linux 服务器缺少中文字体导致乱码），并完善了各类缺失数据的降级提示。
-
-你可以直接复制以下代码覆盖原有文件：
-
-```python
 import os
 import time
 import ssl
@@ -1194,4 +1185,3 @@ if __name__ == "__main__":
     except Exception:
         logging.exception("程序运行失败")
         raise
-```
