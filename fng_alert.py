@@ -3,20 +3,13 @@ import time
 import ssl
 import smtplib
 import logging
-from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from email.header import Header
-from email.utils import make_msgid, parseaddr
+from email.utils import parseaddr
 from html import escape
 
 import requests
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 
 # ============================================================
 # 配置
@@ -411,148 +404,139 @@ def get_history(data):
 
 
 # ============================================================
-# 近一年走势图：返回 PNG 字节流用于 CID 内嵌（解决 Gmail 等客户端屏蔽 data:image 的问题）
+# 近一年走势图：纯 HTML/CSS 原生绘制（收件箱列表外面绝不显示图片药丸，点进去直接显示白底蓝线图）
 # ============================================================
 
-def make_chart_png(history):
+def make_chart_html(history):
     """
-    白色背景、细蓝色折线、浅灰色水平虚线。
-    返回 PNG 原始字节流（bytes），通过 MIME CID 方式内嵌到邮件正文中，
-    彻底解决 Gmail、Outlook、Apple Mail 等主流客户端屏蔽 data:image/png;base64 导致图片裂开的问题。
+    使用纯 HTML table + CSS 渲染白底蓝线走势图（含 25/50/75 虚线参考线与浅蓝底部填充）：
+    1. 不产生任何 MIME 图片附件或内联资源（收件箱列表外面绝对不会出现 fear_and_greed_chart.png 图标）
+    2. 不使用 base64 <img>（不会被 Gmail / Outlook 拦截或出现裂图图标）
+    3. 点进邮件正文直接呈现清晰的白底细蓝线走势图
     """
     if not history or len(history) < 2:
         logging.warning("历史数据不足，无法生成走势图")
         return None
 
-    fig = None
-    buffer = None
-
     try:
-        dates = [point["date"] for point in history]
-        scores = [point["score"] for point in history]
+        # 采样 120 个数据点，兼顾平滑细蓝线走势与极小 HTML 体积（总大小仅 ~32KB，远低于 Gmail 102KB 限制）
+        max_points = 120
+        if len(history) > max_points:
+            step = (len(history) - 1) / (max_points - 1)
+            sampled = [
+                history[round(i * step)]
+                for i in range(max_points)
+            ]
+            sampled[-1] = history[-1]
+        else:
+            sampled = list(history)
 
-        fig, ax = plt.subplots(
-            figsize=(10, 3.2),
-            dpi=150,
-        )
+        n = len(sampled)
+        chart_h = 148  # 图表高度（px）
+        y_25 = int(round((100.0 - 75.0) / 100.0 * chart_h))  # 75分参考线距顶距离 (37px)
+        y_50 = int(round((100.0 - 50.0) / 100.0 * chart_h))  # 50分参考线距顶距离 (74px)
+        y_75 = int(round((100.0 - 25.0) / 100.0 * chart_h))  # 25分参考线距顶距离 (111px)
 
-        fig.patch.set_facecolor("#ffffff")
-        ax.set_facecolor("#ffffff")
-
-        # 25、75 极值区域浅色背景与虚线参考
-        ax.axhspan(0, LOW, color="#fee2e2", alpha=0.28, zorder=0)
-        ax.axhspan(HIGH, 100, color="#dcfce7", alpha=0.28, zorder=0)
-
-        # 蓝色细线与浅蓝渐变填充
-        ax.plot(
-            dates,
-            scores,
-            color="#1683c4",
-            linewidth=1.2,
-            solid_capstyle="round",
-            solid_joinstyle="round",
-            zorder=3,
-        )
-        ax.fill_between(
-            dates,
-            scores,
-            0,
-            color="#1683c4",
-            alpha=0.06,
-            zorder=2,
-        )
-
-        # 标注最新数据点
-        ax.scatter(
-            [dates[-1]],
-            [scores[-1]],
-            color="#0284c7",
-            s=22,
-            zorder=4,
-        )
-
-        # 浅灰色水平虚线
-        ax.grid(
-            axis="y",
-            color="#e5e7eb",
-            linestyle="--",
-            linewidth=0.55,
-            alpha=0.9,
-        )
-
-        # 25、50、75 阈值对应水平虚线
-        for threshold, line_color in (
-            (LOW, "#fca5a5"),
-            (50, "#d1d5db"),
-            (HIGH, "#86efac"),
-        ):
-            ax.axhline(
-                threshold,
-                color=line_color,
-                linestyle="--",
-                linewidth=0.65,
-                alpha=0.85,
-                zorder=1,
+        cols = []
+        for i, pt in enumerate(sampled):
+            s = max(0.0, min(100.0, float(pt["score"])))
+            prev_s = (
+                max(0.0, min(100.0, float(sampled[i - 1]["score"])))
+                if i > 0
+                else s
             )
 
-        ax.set_ylim(0, 100)
-        ax.set_xlim(dates[0], dates[-1])
-        ax.set_yticks([0, int(LOW), 50, int(HIGH), 100])
+            y_curr = int(round((100.0 - s) / 100.0 * chart_h))
+            y_prev = int(round((100.0 - prev_s) / 100.0 * chart_h))
 
-        # 格式化底部月份与左侧刻度
-        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+            line_top = min(y_curr, y_prev)
+            line_bottom = max(y_curr, y_prev)
+            line_h = max(2, line_bottom - line_top + 2)
+            line_bottom = min(chart_h, line_top + line_h)
 
-        # 隐藏左右及顶部边框
-        for side in ("top", "left", "right"):
-            ax.spines[side].set_visible(False)
+            breakpoints = {0, chart_h, line_top, line_bottom}
+            is_dash_col = (i % 2 == 0)
+            if is_dash_col:
+                for y_grid in (y_25, y_50, y_75):
+                    if 0 <= y_grid < chart_h:
+                        breakpoints.add(y_grid)
+                        breakpoints.add(min(chart_h, y_grid + 1))
 
-        # 底部保留一条浅灰色边线
-        ax.spines["bottom"].set_color("#d1d5db")
-        ax.spines["bottom"].set_linewidth(0.7)
+            sorted_pts = sorted(breakpoints)
+            segs = []
+            for k in range(len(sorted_pts) - 1):
+                a, b = sorted_pts[k], sorted_pts[k + 1]
+                h_seg = b - a
+                if h_seg <= 0:
+                    continue
 
-        ax.tick_params(
-            axis="both",
-            which="both",
-            length=0,
-            labelsize=8,
-            colors="#64748b",
-            pad=4,
+                if a >= line_top and b <= line_bottom:
+                    cls = "c-hl" if i == n - 1 else "c-ln"
+                elif is_dash_col and (
+                    (a == y_25 and b == y_25 + 1)
+                    or (a == y_50 and b == y_50 + 1)
+                    or (a == y_75 and b == y_75 + 1)
+                ):
+                    cls = "c-gd"
+                elif a >= line_bottom:
+                    cls = "c-fl"
+                else:
+                    cls = "c-bg"
+
+                segs.append(f'<div class="{cls}" style="height:{h_seg}px"></div>')
+
+            cols.append(f'<td class="c-td">{"".join(segs)}</td>')
+
+        # 底部 6 个等距月份标签
+        label_count = 6
+        label_tds = []
+        for k in range(label_count):
+            idx = round(k * (n - 1) / (label_count - 1))
+            dt_str = sampled[idx]["date"].strftime("%Y-%m")
+            align = (
+                "left"
+                if k == 0
+                else ("right" if k == label_count - 1 else "center")
+            )
+            label_tds.append(
+                f'<td style="font-size:10px;color:#64748b;'
+                f'text-align:{align};padding-top:6px">{dt_str}</td>'
+            )
+
+        q_h = chart_h // 4
+        r_h = chart_h - q_h * 3
+
+        return (
+            '<div style="margin-top:10px;background:#ffffff;'
+            'border-radius:8px;padding:12px 12px 8px">'
+            '<table role="presentation" style="width:100%;'
+            'border-collapse:collapse;table-layout:fixed">'
+            "<tr>"
+            '<td style="width:24px;vertical-align:top;padding-right:5px">'
+            f'<div style="height:{q_h}px;font-size:9px;color:#94a3b8;text-align:right;line-height:1">100</div>'
+            f'<div style="height:{q_h}px;font-size:9px;color:#94a3b8;text-align:right;line-height:1">75</div>'
+            f'<div style="height:{q_h}px;font-size:9px;color:#94a3b8;text-align:right;line-height:1">50</div>'
+            f'<div style="height:{r_h}px;font-size:9px;color:#94a3b8;text-align:right;line-height:1">25</div>'
+            "</td>"
+            '<td style="vertical-align:top">'
+            '<table role="presentation" style="width:100%;'
+            "border-collapse:collapse;table-layout:fixed;"
+            'border-bottom:1px solid #d1d5db">'
+            f"<tr>{''.join(cols)}</tr>"
+            "</table>"
+            '<table role="presentation" style="width:100%;'
+            'border-collapse:collapse;table-layout:fixed">'
+            f"<tr>{''.join(label_tds)}</tr>"
+            "</table>"
+            "</td>"
+            "</tr>"
+            "</table>"
+            "</div>"
         )
-
-        ax.margins(x=0.01, y=0.03)
-
-        fig.subplots_adjust(
-            left=0.04,
-            right=0.985,
-            top=0.95,
-            bottom=0.14,
-        )
-
-        buffer = BytesIO()
-
-        fig.savefig(
-            buffer,
-            format="png",
-            dpi=150,
-            facecolor="#ffffff",
-            bbox_inches="tight",
-            pad_inches=0.06,
-        )
-
-        buffer.seek(0)
-        return buffer.read()
 
     except Exception:
         logging.exception("生成历史走势图失败")
         return None
-
-    finally:
-        if buffer is not None:
-            buffer.close()
-
-        if fig is not None:
-            plt.close(fig)
 
 
 # ============================================================
@@ -911,7 +895,7 @@ def build_email(
     score,
     components,
     history,
-    chart_cid,
+    chart_block,
     market,
     errors,
     timestamp,
@@ -1036,17 +1020,8 @@ def build_email(
         for note in notes
     )
 
-    # 图表通过 MIME CID 内联引用，彻底解决 Gmail / Outlook 屏蔽 base64 图片导致裂图的问题
-    if chart_cid:
-        chart_html = (
-            '<div style="margin-top:10px;background:#ffffff;'
-            'border-radius:8px;padding:6px;overflow:hidden">'
-            '<img alt="CNN Fear and Greed Index one-year chart" '
-            f'src="cid:{chart_cid}" '
-            'style="display:block;width:100%;max-width:100%;'
-            'height:auto;border:0;border-radius:6px" />'
-            "</div>"
-        )
+    if chart_block:
+        chart_html = chart_block
     else:
         chart_html = (
             '<div style="margin-top:10px;padding:18px;'
@@ -1076,6 +1051,14 @@ def build_email(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+.c-td {{ padding:0; margin:0; vertical-align:top; }}
+.c-ln {{ background:#1683c4; font-size:0; line-height:0; }}
+.c-hl {{ background:#0284c7; font-size:0; line-height:0; }}
+.c-gd {{ background:#cbd5e1; font-size:0; line-height:0; }}
+.c-fl {{ background:#f0f7ff; font-size:0; line-height:0; }}
+.c-bg {{ background:#ffffff; font-size:0; line-height:0; }}
+</style>
 </head>
 <body style="margin:0;padding:12px;background:#f2f4f7;color:#101828;font-family:Arial,'Microsoft YaHei',sans-serif">
 
@@ -1120,7 +1103,7 @@ def build_email(
     {chart_html}
 
     <div style="font-size:11px;color:#94a3b8;margin-top:8px;line-height:1.5">
-      蓝线为 CNN 指数历史走势；虚线为 25、50、75 参考阈值。
+      蓝线为 CNN 指数历史走势；浅灰虚线为 25、50、75 参考阈值。
       CNN数据时间：{escape(timestamp.isoformat())}
     </div>
 
@@ -1187,7 +1170,7 @@ def build_email(
       <div>行情来源：Yahoo Finance日线数据</div>
       <div>行情状态：{escape(error_text)}</div>
       <div>提醒阈值：指数严格低于{LOW:g}或严格高于{HIGH:g}时发送（FORCE_SEND=true 时强制发送）</div>
-      <div>说明：CNN底层接口并非承诺长期稳定的公共API；走势图通过 MIME CID 内嵌以兼容主流邮件客户端。</div>
+      <div>说明：CNN底层接口并非承诺长期稳定的公共API；走势图采用纯 HTML/CSS 原生绘制，兼容所有邮件客户端且不在收件箱列表外露附件芯片。</div>
       <div>本报告仅供研究参考，不构成投资建议。</div>
     </div>
   </div>
@@ -1196,11 +1179,10 @@ def build_email(
 </body>
 </html>"""
 
+    # 收件箱外部摘要文字保持与此前完全一致的清爽样式
     plain = (
-        "CNN恐惧与贪婪指数市场监测\n"
-        f"生成时间：{now:%Y-%m-%d %H:%M:%S}（北京时间）\n"
-        f"当前指数：{score:.1f}/100（{label}）\n"
-        f"市场监测：{title}\n"
+        f"DAILY MARKET BRIEF CNN 恐惧与贪婪指数 生成时间：{now:%Y-%m-%d %H:%M:%S}（北京时间） "
+        f"当前指数 {score:.1f} / 100 {label} 市场监测 {title} 规则型观察，不是买卖指令\n\n"
         f"CNN时间：{timestamp.isoformat()}\n"
         f"近一年有效历史点：{len(history)}\n\n"
         "核心子指标：\n"
@@ -1221,10 +1203,10 @@ def build_email(
 
 
 # ============================================================
-# Gmail SMTP（支持多收件人、端口 465 SSL / 587 STARTTLS 及 CID 内嵌图片）
+# Gmail SMTP（纯文本 + HTML，无任何图片/附件挂载，收件箱外部不显示图片标签）
 # ============================================================
 
-def send_email(subject, plain, html, chart_bytes=None, chart_cid=None):
+def send_email(subject, plain, html):
     username = os.getenv("MAIL_USER")
     password = os.getenv("MAIL_PASS")
     recipient_raw = os.getenv("MAIL_TO")
@@ -1250,18 +1232,6 @@ def send_email(subject, plain, html, chart_bytes=None, chart_cid=None):
 
     message.set_content(plain)
     message.add_alternative(html, subtype="html")
-
-    # 将走势图作为 inline 关联资源挂载到 HTML 部分（不显示为普通下载附件，且不被 Gmail 拦截）
-    if chart_bytes and chart_cid:
-        html_part = message.get_payload()[1]
-        html_part.add_related(
-            chart_bytes,
-            maintype="image",
-            subtype="png",
-            cid=f"<{chart_cid}>",
-            filename="fear_and_greed_chart.png",
-            disposition="inline",
-        )
 
     context = ssl.create_default_context()
 
@@ -1318,19 +1288,14 @@ def main():
         return
 
     market, errors = get_market_data()
-    chart_bytes = make_chart_png(history)
-    chart_cid = (
-        make_msgid(domain="cnn.market.monitor")[1:-1]
-        if chart_bytes
-        else None
-    )
+    chart_block = make_chart_html(history)
 
     plain, html, title = build_email(
         data=data,
         score=score,
         components=components,
         history=history,
-        chart_cid=chart_cid,
+        chart_block=chart_block,
         market=market,
         errors=errors,
         timestamp=timestamp,
@@ -1349,8 +1314,6 @@ def main():
         subject=subject,
         plain=plain,
         html=html,
-        chart_bytes=chart_bytes,
-        chart_cid=chart_cid,
     )
 
 
